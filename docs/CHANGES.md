@@ -65,6 +65,8 @@ holds, what changed in the implementation, and where the current evidence is.
 - `DSTATE_DELTA_MIN_WORDS`: queued adds to several words of one line are sent as
   one masked delta-line request; bank-side merging is mask-based.
 - `DSTATE_RANGE_LO_MB`/`HI_MB`: static per-address placement for oracle runs.
+- `DSTATE_EVICT_FOR_DELEGATE`: a delegated request to a line the home does not
+  hold, in a full set, evicts a victim instead of being rejected.
 - `DSTATE_REQ_COMBINE`: the Sequencer issues queued same-word no-return adds
   from one core as a single summed request once the previous request to that
   line completes; all of them complete on its ACK. Only a consecutive run of

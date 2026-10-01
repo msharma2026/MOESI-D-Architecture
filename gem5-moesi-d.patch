@@ -1,9 +1,9 @@
 diff --git a/bench/Makefile b/bench/Makefile
 new file mode 100644
-index 0000000..634066e
+index 0000000..9cba908
 --- /dev/null
 +++ b/bench/Makefile
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,84 @@
 +# Benchmarks for MOESI-D evaluation.
 +#
 +# Built statically for x86-64 gem5 SE mode. Scatter/SpMV use OpenMP;
@@ -21,7 +21,7 @@ index 0000000..634066e
 +# LDLIBS=/path/to/gem5/util/m5/build/x86/out/libm5.a
 +# ROI includes synchronization/final merge and excludes serial verification.
 +
-+DSTATE  := scatter_dstate scatter_nm scatter_multi scatter_rw scatter_phased scatter_mixed spmv_dstate
++DSTATE  := scatter_dstate scatter_nm scatter_multi scatter_rw scatter_phased scatter_mixed random_stress graph_push spmv_dstate
 +BASE    := scatter_base scatter_base_nm scatter_multi_base scatter_rw_base spmv_base
 +LITMUS  := litmus_dstate litmus_naive litmus_fc litmus_priv litmus_privstream
 +CMS     := cms_dstate cms_naive cms_priv cms_privstream
@@ -58,6 +58,10 @@ index 0000000..634066e
 +scatter_phased:     scatter_phased.c     ; $(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDLIBS)
 +# --- scatter_mixed: shared all-writer lines at 512 MB and per-thread read+add counters at 768 MB
 +scatter_mixed:      scatter_mixed.c      ; $(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDLIBS)
++# --- random_stress: seeded random adds (both widths), loads, fences, private stores, evictions
++random_stress:      random_stress.c      ; $(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDLIBS)
++# --- graph_push: power-law destination scatter, one line per node, serial oracle
++graph_push:         graph_push.c         ; $(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDLIBS)
 +
 +# --- scatter_rw: updates interleaved with full-line reads -----------------
 +scatter_rw:         scatter_rw.c      ; $(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDLIBS)
@@ -495,6 +499,63 @@ index 0000000..1320e79
 +    if (rc) { fprintf(stderr, "pthread failure: %d\n", rc); exit(1); }
 +}
 +#endif
+diff --git a/bench/graph_push.c b/bench/graph_push.c
+new file mode 100644
+index 0000000..06f131b
+--- /dev/null
++++ b/bench/graph_push.c
+@@ -0,0 +1,51 @@
++/* Push-style graph kernel: a weighted in-degree / contribution scatter.
++ * Edges are generated once from a seed with a power-law destination skew (the
++ * square of a uniform variate), each thread processes a contiguous slice of the
++ * edge list and adds the edge's contribution to the destination's accumulator,
++ * one 128-byte line per node. The oracle is a serial pass over the same edges.
++ * This is the wide, skewed key space that push-style PageRank / BFS frontiers /
++ * histogram building present to the coherence protocol.
++ *
++ *     graph_push threads edges nodes seed */
++#include "dstate_ops.h"
++#include <string.h>
++#include <omp.h>
++#define MAXN 65536
++typedef struct { uint32_t v; char pad[124]; } line_t;
++static line_t acc[MAXN] __attribute__((aligned(128)));
++
++static inline uint32_t rng(uint32_t *s) { *s ^= *s << 13; *s ^= *s >> 17; *s ^= *s << 5; return *s; }
++
++int main(int argc, char **argv) {
++    if (argc != 5) { fprintf(stderr, "usage: %s threads edges nodes seed\n", argv[0]); return 1; }
++    int th = bench_int(argv[1], 1, 64);
++    int ne = bench_int(argv[2], 1, 1 << 26);
++    int nn = bench_int(argv[3], 1, MAXN);
++    uint32_t seed = (uint32_t)bench_int(argv[4], 1, INT_MAX);
++    uint32_t *dst = bench_calloc((size_t)ne, sizeof(uint32_t));
++    uint8_t *wgt = bench_calloc((size_t)ne, sizeof(uint8_t));
++    uint32_t s = seed * 2654435761u + 12345u;
++    for (int e = 0; e < ne; ++e) {
++        uint32_t r = rng(&s);
++        uint64_t u2 = ((uint64_t)r * (uint64_t)r) >> 32;          /* skew toward low node ids */
++        dst[e] = (uint32_t)((u2 * (uint64_t)nn) >> 32);
++        wgt[e] = (uint8_t)(1 + (rng(&s) & 7));
++    }
++    memset(acc, 0, (size_t)nn * sizeof(line_t));
++    omp_set_dynamic(0); omp_set_num_threads(th);
++    bench_roi_begin();
++    #pragma omp parallel
++    {
++        int tid = omp_get_thread_num();
++        int lo = (int)((long long)ne * tid / th), hi = (int)((long long)ne * (tid + 1) / th);
++        for (int e = lo; e < hi; ++e) dstate_add32(&acc[dst[e]].v, wgt[e]);
++        __atomic_thread_fence(__ATOMIC_SEQ_CST);
++    }
++    bench_roi_end();
++    uint32_t *want = bench_calloc((size_t)nn, sizeof(uint32_t));
++    for (int e = 0; e < ne; ++e) want[dst[e]] += wgt[e];
++    int ok = 1; long long bad = 0, touched = 0;
++    for (int n = 0; n < nn; ++n) { touched += want[n] != 0; if (acc[n].v != want[n]) { ok = 0; ++bad; } }
++    printf("graph push oracle: %s (%d edges -> %d nodes, %lld touched, %lld bad)\n", ok ? "CORRECT" : "WRONG", ne, nn, touched, bad);
++    return ok ? 0 : 2;
++}
 diff --git a/bench/integer_fixture.mtx b/bench/integer_fixture.mtx
 new file mode 100644
 index 0000000..5b0d4e2
@@ -911,6 +972,93 @@ index 0000000..361d4be
 +    bad |= run(1);
 +    puts(bad ? "FAIL" : "PASS: no younger store observed before an older add");
 +    return bad;
++}
+diff --git a/bench/random_stress.c b/bench/random_stress.c
+new file mode 100644
+index 0000000..d7a1eee
+--- /dev/null
++++ b/bench/random_stress.c
+@@ -0,0 +1,81 @@
++/* Randomized stress program for the delegated path. Every thread performs a
++ * seeded random mix of 32-bit adds (bytes 0..63 of a line), 64-bit adds (bytes
++ * 64..127), loads of random words, full fences, and plain stores to a private
++ * line, over `lines` lines (large values exceed the L2 and force evictions of
++ * retained lines). Widths never share bytes, so the final value of every word is
++ * the exact sum of the deltas recorded per thread; the check runs after the
++ * parallel region. Different seeds give different interleavings.
++ *
++ *     random_stress threads iters lines seed */
++#include "dstate_ops.h"
++#include <string.h>
++#include <omp.h>
++#define MAXL 16384
++typedef struct { uint32_t w32[16]; uint64_t w64[8]; } line_t;   /* 128 bytes */
++static line_t lines_[MAXL] __attribute__((aligned(128)));
++static line_t priv_[64] __attribute__((aligned(128)));
++
++static inline uint32_t rng(uint32_t *s) { *s ^= *s << 13; *s ^= *s >> 17; *s ^= *s << 5; return *s; }
++
++int main(int argc, char **argv) {
++    if (argc != 5) { fprintf(stderr, "usage: %s threads iters lines seed\n", argv[0]); return 1; }
++    int th = bench_int(argv[1], 1, 64);
++    int it = bench_int(argv[2], 1, 1 << 24);
++    int nl = bench_int(argv[3], 1, MAXL);
++    uint32_t seed = (uint32_t)bench_int(argv[4], 1, INT_MAX);
++    memset(lines_, 0, (size_t)nl * sizeof(line_t));
++    memset(priv_, 0, sizeof(priv_));
++    /* per-thread expectation tables */
++    uint32_t *e32 = bench_calloc((size_t)th * nl * 16, sizeof(uint32_t));
++    uint64_t *e64 = bench_calloc((size_t)th * nl * 8, sizeof(uint64_t));
++    long long sink = 0; int priv_ok = 1;
++    omp_set_dynamic(0); omp_set_num_threads(th);
++    bench_roi_begin();
++    #pragma omp parallel reduction(+:sink) reduction(&:priv_ok)
++    {
++        int tid = omp_get_thread_num();
++        uint32_t s = seed * 2654435761u ^ (uint32_t)(tid + 1) * 0x9e3779b9u;
++        uint32_t *m32 = e32 + (size_t)tid * nl * 16;
++        uint64_t *m64 = e64 + (size_t)tid * nl * 8;
++        uint32_t pv = 0;
++        for (int i = 0; i < it; ++i) {
++            uint32_t r = rng(&s);
++            int line = (int)((uint64_t)rng(&s) * (uint64_t)nl >> 32);
++            switch (r & 15) {
++            case 0: case 1: case 2: case 3: case 4: case 5: {          /* 32-bit add */
++                int w = (r >> 4) & 15; uint32_t d = rng(&s);
++                dstate_add32(&lines_[line].w32[w], d); m32[(size_t)line * 16 + w] += d; break; }
++            case 6: case 7: case 8: case 9: {                           /* 64-bit add */
++                int w = (r >> 4) & 7; uint64_t d = ((uint64_t)rng(&s) << 32) | rng(&s);
++                dstate_add64(&lines_[line].w64[w], d); m64[(size_t)line * 8 + w] += d; break; }
++            case 10: case 11: case 12:                                  /* load a random word */
++                sink += __atomic_load_n(&lines_[line].w32[(r >> 4) & 15], __ATOMIC_RELAXED); break;
++            case 13:                                                    /* full fence */
++                __atomic_thread_fence(__ATOMIC_SEQ_CST); break;
++            default: {                                                  /* private store/load */
++                pv += r; priv_[tid].w32[0] = pv;
++                __atomic_thread_fence(__ATOMIC_SEQ_CST);
++                priv_ok &= (priv_[tid].w32[0] == pv); break; }
++            }
++        }
++        __atomic_thread_fence(__ATOMIC_SEQ_CST);   /* relaxed-ordering contract: drain before publishing */
++    }
++    bench_roi_end();
++    int ok = priv_ok;
++    long long bad = 0;
++    for (int l = 0; l < nl; ++l) {
++        for (int w = 0; w < 16; ++w) {
++            uint32_t want = 0;
++            for (int t = 0; t < th; ++t) want += e32[((size_t)t * nl + l) * 16 + w];
++            if (lines_[l].w32[w] != want) { ok = 0; ++bad; }
++        }
++        for (int w = 0; w < 8; ++w) {
++            uint64_t want = 0;
++            for (int t = 0; t < th; ++t) want += e64[((size_t)t * nl + l) * 8 + w];
++            if (lines_[l].w64[w] != want) { ok = 0; ++bad; }
++        }
++    }
++    printf("random stress oracle: %s (%d lines x 24 words, %d threads x %d ops, seed %u, %lld bad words) read_sink=%lld\n",
++           ok ? "CORRECT" : "WRONG", nl, th, it, seed, bad, sink);
++    return ok ? 0 : 2;
 +}
 diff --git a/bench/scatter_bench.c b/bench/scatter_bench.c
 new file mode 100755
@@ -1665,10 +1813,10 @@ index 0000000..1ec40df
 +print("Exiting @ tick", m5.curTick(), "because", exit_event.getCause())
 diff --git a/configs/ruby/MOESI_D.py b/configs/ruby/MOESI_D.py
 new file mode 100644
-index 0000000..2cf0e36
+index 0000000..5e4ada5
 --- /dev/null
 +++ b/configs/ruby/MOESI_D.py
-@@ -0,0 +1,376 @@
+@@ -0,0 +1,379 @@
 +# Copyright (c) 2019 ARM Limited
 +# All rights reserved.
 +#
@@ -1781,6 +1929,8 @@ index 0000000..2cf0e36
 +    queue_stall = flag_env("DSTATE_QUEUE_STALL", "0")
 +    # Far reads: loads of a retained line get a snapshot, no sharer is recorded.
 +    far_reads = flag_env("DSTATE_FAR_READS", "0")
++    # Evict a victim for a delegated request to a line the home does not hold.
++    evict_for_delegate = flag_env("DSTATE_EVICT_FOR_DELEGATE", "0")
 +    # Static placement (oracle runs): delegate only VIRTUAL addresses in [lo, hi) MB.
 +    range_lo = bounded_env("DSTATE_RANGE_LO_MB", "0", 0, 1 << 30)
 +    range_hi = bounded_env("DSTATE_RANGE_HI_MB", "0", 0, 1 << 30)
@@ -1933,6 +2083,7 @@ index 0000000..2cf0e36
 +            d_state_busy_stall=busy_stall,
 +            d_state_queue_stall=queue_stall,
 +            d_state_far_reads=far_reads,
++            d_state_evict_for_delegate=evict_for_delegate,
 +            d_state_hit_latency=hit_latency,
 +            d_state_hotwords=hotwords,
 +            d_state_merge_limit=merge_limit,
@@ -4259,10 +4410,10 @@ index 0000000..38f3063
 +}
 diff --git a/src/mem/ruby/protocol/MOESI_D-L2cache.sm b/src/mem/ruby/protocol/MOESI_D-L2cache.sm
 new file mode 100644
-index 0000000..df81bd5
+index 0000000..4494b03
 --- /dev/null
 +++ b/src/mem/ruby/protocol/MOESI_D-L2cache.sm
-@@ -0,0 +1,3556 @@
+@@ -0,0 +1,3566 @@
 +/*
 + * Copyright (c) 2019 ARM Limited
 + * All rights reserved
@@ -4334,6 +4485,10 @@ index 0000000..df81bd5
 +  // with no intervening update the line is judged read-heavy and the next load
 +  // takes the ordinary path (a cached copy). Default off.
 +  bool d_state_far_reads := "False";
++  // A delegated request for a line the home does not hold, in a full set: evict
++  // a victim (as an L1 GETX does) instead of rejecting into a migration. Default
++  // off (reject, as shipped).
++  bool d_state_evict_for_delegate := "False";
 +  //   hit_latency   service time when the target word is in the bank's hot-word
 +  //                 buffer (registers, not the SRAM array); default = full latency
 +  //   hotwords      hot-word buffer entries per bank; 0 disables the model
@@ -5200,6 +5355,12 @@ index 0000000..df81bd5
 +                     in_msg.DStateOffset % in_msg.Len != 0 ||
 +                     in_msg.DStateOffset + in_msg.Len > in_msg.DataBlk.getBlockSize())) {
 +            trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);
++          } else if (is_invalid(ce) && L2cache.cacheAvail(in_msg.addr) == false &&
++                     d_state_evict_for_delegate) {
++            // Make room: the victim's replacement runs and this request, still at
++            // the head of the queue, is re-analysed when it completes.
++            Addr victim := L2cache.cacheProbe(in_msg.addr);
++            trigger(Event:L2_Replacement, victim, getCacheEntry(victim), TBEs[victim]);
 +          } else if (is_invalid(ce) && L2cache.cacheAvail(in_msg.addr) == false) {
 +            trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);
 +          } else if (dstateWouldPromote(ce, in_msg.Requestor) || st == State:D) {

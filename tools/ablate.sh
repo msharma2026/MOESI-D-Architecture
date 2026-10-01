@@ -33,7 +33,7 @@ KN_FULL="DSTATE_QUEUE_DEPTH=8 DSTATE_INIT_INTERVAL=4 DSTATE_BUSY_STALL=1"
 matrix() { local name=$1 bin=$2 args=$3 cores=$4 cpu=$5; shift 5
   [ -d "$OUT/$name" ] && { echo "$name: exists, skipping"; return; }
   env "$@" python3 "$SRC/tools/run_matrix.py" --gem5-tree "$TREE" --binary "$W/bench/$bin" --workload-args "$args" \
-      --out "$OUT/$name" --cores "$cores" --banks "${BANKS:-4}" --extra="${EXTRA:-}" --cpu "$cpu" --repeats 1 --timeout "${TIMEOUT:-2400}" --modes "${MODES:-local,remote,persistent,forced-nack}" > "$OUT/$name.log" 2>&1
+      --out "$OUT/$name" --cores "$cores" --banks "${BANKS:-4}" --extra="${EXTRA:-}" ${REQROI:+--require-roi} ${GEM5BIN:+--gem5-binary "$GEM5BIN"} --cpu "$cpu" --repeats 1 --timeout "${TIMEOUT:-2400}" --modes "${MODES:-local,remote,persistent,forced-nack}" > "$OUT/$name.log" 2>&1
   printf "%-34s %s/%s modes pass  %s\n" "$name" "$(grep -cE ' PASS$' "$OUT/$name.log")" "$(echo "${MODES:-local,remote,persistent,forced-nack}" | tr ',' '\n' | wc -l)" "$(grep -E ' FAIL' "$OUT/$name.log" | tr '\n' ' ')"; }
 # direct gem5 run for the ordering litmus (prints PASS/FAIL, not CORRECT)
 litmus() { local name=$1 bin=$2; shift 2
@@ -410,6 +410,82 @@ v4)
   all)
     for ph in gates perf apps scale mixed regate; do echo "--- $ph $(date +%H:%M)"; bash "$0" v4 $ph; done ;;
   esac ;;
+v5)
+  # Round five: stress seeds, promotion-policy grid, applications at 16 cores, the
+  # graph kernel, ROI-timed reruns, 32/64-core meshes, debug-binary gates.
+  #   usage: ablate.sh v5 stress|policy|apps3|roi|mesh|debug|evict
+  KN_V3="DSTATE_QUEUE_DEPTH=16 DSTATE_INIT_INTERVAL=4 DSTATE_BUSY_STALL=1 DSTATE_QUEUE_STALL=1 DSTATE_REQ_COMBINE=16 DSTATE_MERGE_LIMIT=64"
+  FAR="DSTATE_FAR_READS=1 DSTATE_READ_DOWNGRADE=64"
+  KN_T4="$KN_V3 DSTATE_EXEC_LATENCY=20 $FAR"
+  KN_TH4="$KN_V3 DSTATE_HOTWORDS=32 DSTATE_HIT_LATENCY=4 $FAR"
+  KN_R4="$KN_TH4 DSTATE_RELAXED_AMO=1 DSTATE_DELTA_MIN_WORDS=2"
+  PERF3="local,remote,persistent"
+  BUF16="DSTATE_BUFFER_SIZE=${BUF16:-256}"
+  case ${2:-all} in
+  stress)
+    # 4096 lines = 2x the L2: retained lines are evicted under the random traffic
+    for seed in 1 2 3; do
+      matrix N${seed}_stress_R4_o3     random_stress "4 30000 4096 $seed" 4 X86O3CPU    $KN_R4  &
+      matrix N${seed}_stress_T4_o3     random_stress "4 30000 4096 $seed" 4 X86O3CPU    $KN_T4  &
+      matrix N${seed}_stress_TH4_minor random_stress "4 30000 4096 $seed" 4 X86MinorCPU $KN_TH4 &
+      wait
+    done
+    matrix N4_stress_R4_evict_o3       random_stress "4 30000 8192 4"     4 X86O3CPU    $KN_R4 DSTATE_EVICT_FOR_DELEGATE=1 &
+    matrix N5_stress_T4_evict_o3       random_stress "4 30000 8192 5"     4 X86O3CPU    $KN_T4 DSTATE_EVICT_FOR_DELEGATE=1 &
+    matrix N6_stress_R4_16c            random_stress "16 10000 4096 6"    16 X86O3CPU   $KN_R4 $BUF16 &
+    wait ;;
+  policy)
+    for thr in 1 2 8; do for dn in 8 64; do
+      MODES=$PERF3 matrix P_phased512_R4_thr${thr}_dn${dn} scatter_phased "4 50 512 8" 4 X86O3CPU $KN_V3 DSTATE_HOTWORDS=32 DSTATE_HIT_LATENCY=4 DSTATE_RELAXED_AMO=1 DSTATE_DELTA_MIN_WORDS=2 DSTATE_FAR_READS=1 DSTATE_THRESHOLD=$thr DSTATE_READ_DOWNGRADE=$dn &
+    done; wait; done ;;
+  apps3)
+    export TIMEOUT=7200
+    MODES=$PERF3 matrix B0_graph_R4_4c_wide   graph_push "4 1000000 65536 1" 4 X86O3CPU $KN_R4 &
+    MODES=$PERF3 matrix B1_graph_T4_4c_wide   graph_push "4 1000000 65536 1" 4 X86O3CPU $KN_T4 &
+    MODES=$PERF3 matrix B2_graph_R4_4c_dense  graph_push "4 1000000 4096 1"  4 X86O3CPU $KN_R4 &
+    wait
+    MODES=$PERF3 matrix B3_cms_16c_R4         cms_dstate "16 5000"            16 X86O3CPU $KN_R4 $BUF16 &
+    MODES=$PERF3 matrix B4_cms_16c_T4         cms_dstate "16 5000"            16 X86O3CPU $KN_T4 $BUF16 &
+    wait
+    MODES=$PERF3 matrix B5_graph_R4_16c_wide  graph_push "16 2000000 65536 1" 16 X86O3CPU $KN_R4 $BUF16 &
+    MODES=$PERF3 matrix B6_graph_T4_16c_wide  graph_push "16 2000000 65536 1" 16 X86O3CPU $KN_T4 $BUF16 &
+    wait ;;
+  roi)
+    # ROI-instrumented guests (BENCH_DIR points at the libm5 build); stats = first dump
+    export REQROI=1 TIMEOUT=7200
+    MODES=$PERF3 matrix I0_multi512_T4_roi     scatter_multi  "4 2000 512"    4 X86O3CPU  $KN_T4 &
+    MODES=$PERF3 matrix I1_multi512_R4_roi     scatter_multi  "4 2000 512"    4 X86O3CPU  $KN_R4 &
+    MODES=$PERF3 matrix I2_hotkey800k_R4_roi   scatter_dstate "4 200000 1"    4 X86O3CPU  $KN_R4 &
+    MODES=$PERF3 matrix I3_rw800k_R4_roi       scatter_rw     "4 200000 32 8" 4 X86O3CPU  $KN_R4 &
+    wait
+    MODES=$PERF3 matrix I4_hotkey800k_16c_R4_roi scatter_dstate "16 50000 1"    16 X86O3CPU $KN_R4 $BUF16 &
+    MODES=$PERF3 matrix I5_rw800k_16c_R4_roi     scatter_rw     "16 50000 32 8" 16 X86O3CPU $KN_R4 $BUF16 &
+    wait
+    MODES=$PERF3 matrix I6_phased512_16c_R4_roi  scatter_phased "16 25 512 8"   16 X86O3CPU $KN_R4 $BUF16 &
+    MODES=$PERF3 matrix I7_multi512_16c_R4_roi   scatter_multi  "16 500 512"    16 X86O3CPU $KN_R4 $BUF16 &
+    wait ;;
+  mesh)
+    # controllers must be a multiple of the router count: L1s + banks + directories
+    export TIMEOUT=28800
+    MODES=local,persistent BANKS=16 EXTRA="--num-dirs=16 --topology=Mesh_XY --mesh-rows=4" matrix H32_multi512_32c_R4_mesh scatter_multi "32 250 512" 32 X86O3CPU $KN_R4 DSTATE_BUFFER_SIZE=512 &
+    wait
+    MODES=local,persistent BANKS=32 EXTRA="--num-dirs=32 --topology=Mesh_XY --mesh-rows=8" matrix H64_multi512_64c_R4_mesh scatter_multi "64 125 512" 64 X86O3CPU $KN_R4 DSTATE_BUFFER_SIZE=512 &
+    wait ;;
+  debug)
+    # assertion-checking binary on the regression and one stress seed
+    export GEM5BIN=$TREE/build/X86_MOESI_D/gem5.debug TIMEOUT=14400
+    matrix D0_regress_R4_fenced_debug coherence_regression_fenced "" 5 X86O3CPU $KN_R4 &
+    matrix D1_regress_T4_debug        coherence_regression        "" 5 X86O3CPU $KN_T4 &
+    wait
+    matrix D2_stress_R4_debug         random_stress "4 5000 1024 7" 4 X86O3CPU $KN_R4 &
+    matrix D3_regress_TH4_minor_debug coherence_regression "" 5 X86MinorCPU $KN_TH4 &
+    wait ;;
+  evict)
+    # capacity rejections past the L2 (8,192 lines) with eviction-for-delegate
+    MODES=$PERF3 matrix E0_multi8192_R4_evict scatter_multi "4 125 8192" 4 X86O3CPU $KN_R4 DSTATE_EVICT_FOR_DELEGATE=1 &
+    MODES=$PERF3 matrix E1_multi8192_T4_evict scatter_multi "4 125 8192" 4 X86O3CPU $KN_T4 DSTATE_EVICT_FOR_DELEGATE=1 &
+    wait ;;
+  esac ;;
 report)
   # One row per (run, mode). Update/response message counts come from the L1's terminal
   # ACK/NACK counters (Garnet emits no per-size-class msg_count); newBytes uses the derived
@@ -422,6 +498,7 @@ report)
         function vsum(line,   n, parts, i, t, s) { n = split(line, parts, "|"); s = 0;
           if (n == 1) { split(line, t, " "); return t[2] + 0 }
           for (i = 2; i <= n; i++) { split(parts[i], t, " "); s += t[1] + 0 } return s }
+        /End Simulation Statistics/{exit}
         /^simSeconds/{s=$2}
         /L2Cache_Controller\.DState_Reject /{r=vsum($0)} /L2Cache_Controller\.DState_Busy /{b=vsum($0)}
         /L2Cache_Controller\.DState_Cold /{c=vsum($0)}   /L2Cache_Controller\.DState_Hot /{h=vsum($0)}

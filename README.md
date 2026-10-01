@@ -26,8 +26,13 @@ relaxed no-return ordering of Intel RAO-INT (`DSTATE_RELAXED_AMO=1`); 2.3–2.5�
 1.6× (relaxed) faster at 16 cores**. The retention policy (D) earns its keep
 through **far reads**: the read-interleaved single line, 3.2× slower in round 3,
 is 18% slower at 4 cores and **2.2× faster at 16 cores**; phased update/read
-workloads gain 8–28% from retention at 16 cores. Whole-program, single
-deterministic runs; not an application speedup.
+workloads gain 8–28% from retention at 16 cores. On a 4×4 mesh the 16-core
+many-line gain is **4.95×** (migrations pay for hops, home execution does not);
+32 and 64 cores on larger meshes give 4.9× and 3.2×. Correctness: directed
+regression, ordering litmus, a seeded randomized stress program on both CPU
+models, and the assertion-checking `gem5.debug` build all pass with the delegated
+path exercised. Whole-program and ROI-timed single deterministic runs on
+microbenchmarks and small kernels; not an application speedup.
 
 ## What changed since v1.0.0
 
@@ -125,6 +130,7 @@ ROI instrumentation and performance acceptance criteria.
 | `DSTATE_DELTA_MIN_WORDS` | 0 | Queued adds to at least this many different words of one line are sent as one masked delta-line request (32–144 B by word count); 0 disables |
 | `DSTATE_RANGE_LO_MB` / `_HI_MB` | 0 / 0 | When hi > lo, only adds to virtual addresses in [lo MB, hi MB) are delegated (static placement for oracle runs) |
 | `DSTATE_MAX_OUTSTANDING` | 16 | Per-core outstanding Ruby requests (gem5 default); applies to every mode |
+| `DSTATE_EVICT_FOR_DELEGATE` | 0 | 1: a delegated request to a line the home does not hold, in a full set, evicts a victim (as an L1 GETX does) instead of being rejected |
 | `DSTATE_BUFFER_SIZE` | 32 | Entries per configured endpoint/trigger buffer |
 | `DSTATE_TBES` | 16 | L1/L2 controller TBE count |
 | `DSTATE_THRESHOLD` | 4 | Saturating accepted-update count needed for promotion |

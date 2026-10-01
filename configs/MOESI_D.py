@@ -110,6 +110,8 @@ def create_system(
     queue_stall = flag_env("DSTATE_QUEUE_STALL", "0")
     # Far reads: loads of a retained line get a snapshot, no sharer is recorded.
     far_reads = flag_env("DSTATE_FAR_READS", "0")
+    # Evict a victim for a delegated request to a line the home does not hold.
+    evict_for_delegate = flag_env("DSTATE_EVICT_FOR_DELEGATE", "0")
     # Static placement (oracle runs): delegate only VIRTUAL addresses in [lo, hi) MB.
     range_lo = bounded_env("DSTATE_RANGE_LO_MB", "0", 0, 1 << 30)
     range_hi = bounded_env("DSTATE_RANGE_HI_MB", "0", 0, 1 << 30)
@@ -262,6 +264,7 @@ def create_system(
             d_state_busy_stall=busy_stall,
             d_state_queue_stall=queue_stall,
             d_state_far_reads=far_reads,
+            d_state_evict_for_delegate=evict_for_delegate,
             d_state_hit_latency=hit_latency,
             d_state_hotwords=hotwords,
             d_state_merge_limit=merge_limit,

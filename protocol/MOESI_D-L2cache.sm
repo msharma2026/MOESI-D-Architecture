@@ -69,6 +69,10 @@ machine(MachineType:L2Cache, "Token protocol")
   // with no intervening update the line is judged read-heavy and the next load
   // takes the ordinary path (a cached copy). Default off.
   bool d_state_far_reads := "False";
+  // A delegated request for a line the home does not hold, in a full set: evict
+  // a victim (as an L1 GETX does) instead of rejecting into a migration. Default
+  // off (reject, as shipped).
+  bool d_state_evict_for_delegate := "False";
   //   hit_latency   service time when the target word is in the bank's hot-word
   //                 buffer (registers, not the SRAM array); default = full latency
   //   hotwords      hot-word buffer entries per bank; 0 disables the model
@@ -935,6 +939,12 @@ machine(MachineType:L2Cache, "Token protocol")
                      in_msg.DStateOffset % in_msg.Len != 0 ||
                      in_msg.DStateOffset + in_msg.Len > in_msg.DataBlk.getBlockSize())) {
             trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);
+          } else if (is_invalid(ce) && L2cache.cacheAvail(in_msg.addr) == false &&
+                     d_state_evict_for_delegate) {
+            // Make room: the victim's replacement runs and this request, still at
+            // the head of the queue, is re-analysed when it completes.
+            Addr victim := L2cache.cacheProbe(in_msg.addr);
+            trigger(Event:L2_Replacement, victim, getCacheEntry(victim), TBEs[victim]);
           } else if (is_invalid(ce) && L2cache.cacheAvail(in_msg.addr) == false) {
             trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);
           } else if (dstateWouldPromote(ce, in_msg.Requestor) || st == State:D) {

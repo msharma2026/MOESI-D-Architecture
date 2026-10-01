@@ -7,6 +7,8 @@ bench/scatter_multi
 bench/scatter_multi_base
 bench/scatter_phased
 bench/scatter_mixed
+bench/random_stress
+bench/graph_push
 bench/scatter_rw
 bench/scatter_rw_base
 bench/spmv_dstate

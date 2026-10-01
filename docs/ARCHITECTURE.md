@@ -242,6 +242,30 @@ fold into the executing operation. **Static placement** (`DSTATE_RANGE_LO_MB`,
 `DSTATE_RANGE_HI_MB`) delegates only adds to one virtual-address range, decided
 in the Sequencer (Ruby sees physical addresses), for oracle experiments.
 
+**Capacity** (`DSTATE_EVICT_FOR_DELEGATE`): a delegated request for a line the
+home does not hold, arriving at a full set, triggers the victim's replacement
+exactly as an L1 GETX does, and is re-analysed from the head of the queue when
+the replacement completes; by default it is rejected into a migration.
+
+**Evaluated and not built: ordered far reads under TSO.** A load that follows a
+core's own in-flight add to the same line waits at that L1 for the add's ACK,
+then issues; under TSO this exposes the add's full latency on every read. The
+proposal was to send the read at once and let the home serve it after applying
+that add. Two facts bound it. Garnet does not guarantee delivery order between
+two messages of one source-destination pair (virtual channels are arbitrated
+independently), so the home cannot assume the add arrived first; the only safe
+rule is to serve the read when the requester's add is *known* to be queued or
+executing at the home (a TBE naming that requester) and to refuse it otherwise,
+after which the L1 falls back to today's path. The serviceable window is
+therefore the add's residence time at the home, a few tens of cycles, against a
+network round trip of about a hundred; the upper bound on the saving is small.
+It also needs the Sequencer to keep a load outstanding alongside a no-return
+add to the same line, a change to the request-table invariant every other
+completion path relies on. The measured TSO deficit it would address is +33% at
+16 cores on one read-interleaved line. It was judged not worth the risk in this
+revision; the design is recorded here so it can be built against these
+constraints if that regime matters.
+
 Separate virtual networks and priority for completion/responses help preserve
 progress but do **not** prove deadlock freedom with finite queues. Required
 remaining work includes dependency graphs, adversarial interleavings and

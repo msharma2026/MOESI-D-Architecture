@@ -115,6 +115,17 @@ Round-four mechanisms (`ablate.sh v4`), layered on the round-three columns:
 | oracle | `DSTATE_RANGE_LO_MB=512 DSTATE_RANGE_HI_MB=768` on `scatter_mixed` | each region given its best static treatment; bounds what any dynamic policy can earn |
 | request limit | `DSTATE_MAX_OUTSTANDING=32/64` | per-core outstanding-request sweep at 16 cores |
 
+Round-five programs and columns (`ablate.sh v5`): `bench/random_stress` (seeded
+random mix of both add widths, loads, fences and private stores over a working
+set twice the L2; exact per-word oracle) on O3, Minor and the `gem5.debug`
+binary; `bench/graph_push` (power-law destination scatter, one line per node,
+serial oracle); the promotion/downgrade grid on the phased workload; ROI-timed
+reruns of the headline matrices with `libm5` guests (statistics from the first
+dump; `--require-roi`); 32- and 64-core meshes (controllers must be a multiple
+of the router count: L1s + banks + directories); `DSTATE_EVICT_FOR_DELEGATE`
+on the 8,192-line working set. The report now also carries Garnet's average hop
+count per flit, so "flits × hops × 16 B" is available as a link-traffic proxy.
+
 `run_matrix.py --modes` selects a subset of the four modes; `ablate.sh v3 scale`
 uses `local,remote,persistent` at 8 and 16 cores, and `v3 phased` runs
 `bench/scatter_phased` (update every line, then every thread reads every line,

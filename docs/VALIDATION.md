@@ -164,6 +164,27 @@ Three findings that changed the campaign, none of them in the protocol:
    case; the SpMV rows use a generated 4096×4096 / 65,536-nnz integer matrix
    (`bench/gen_integer_matrix.py 4096 65536 1`, SHA-256 `e435b27da80f6eca…`).
 
+### Round 5 (2026-10-01): randomized stress, debug binary, ROI timing
+
+`bench/random_stress` gives the protocol what the stock random tester never did:
+seeded random no-return adds of both widths (never sharing bytes), loads, full
+fences and private stores over a working set twice the L2, with an exact per-word
+oracle. Three seeds on O3 relaxed (R4), O3 TSO (T4) and Minor TSO (TH4), four
+modes each: **36/36 CORRECT with coverage**. Two more seeds with
+`DSTATE_EVICT_FOR_DELEGATE=1` on 8,192 lines and one at 16 cores: all modes
+CORRECT. The regression (fenced relaxed, TSO O3, TSO Minor) and one stress seed
+on **`gem5.debug`** (assertions enabled, including every SLICC resource and
+state assertion): 16/16 CORRECT, no assertion fired.
+
+ROI-timed reruns used guests built against `libm5`
+(`CPPFLAGS=-DBENCH_GEM5_ROI`, `--require-roi`); the reported statistics are the
+first dump (updates, synchronization and merge; the serial oracle excluded).
+Numbers in the results file, round 5.
+
+The `graph_push` application run with the round-4 knobs rejected 85% of its adds
+on the 8 MB working set (the home's sets were full and the shipped behaviour is
+to reject); the eviction-for-delegate variants are the rows that count there.
+
 ### Measurement caveats that apply to every number
 
 - **Whole-program `simSeconds`, no ROI.** `libm5` was not built, so times include
@@ -178,7 +199,7 @@ Three findings that changed the campaign, none of them in the protocol:
 
 ### Not performed / not claimed
 
-- `gem5.debug` build; fault/interrupt ordering on either CPU.
+- Fault/interrupt ordering on either CPU (the `gem5.debug` build now gates the regression and stress programs).
 - Root cause of the 16-core, 32-entry-buffer deadlock report in the base protocol
   (true deadlock vs starvation), and bank-count sweeps at 16 cores.
 - A non-deterministic or larger-window litmus for the relaxed knob: L7 shows only that

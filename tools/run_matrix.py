@@ -87,13 +87,15 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--require-roi", action="store_true")
     parser.add_argument("--extra", default="", help="Additional gem5 config options, saved verbatim")
+    parser.add_argument("--gem5-binary", type=Path, default=None,
+                        help="gem5 binary to run (default: <tree>/build/X86_MOESI_D/gem5.opt)")
     parser.add_argument("--modes", default=",".join(MODES),
                         help="Comma-separated subset of " + ",".join(MODES))
     args = parser.parse_args()
     if args.cores < 1 or args.banks < 1 or args.banks & (args.banks - 1) or args.repeats < 1 or args.timeout < 1:
         parser.error("positive cores/repeats/timeout and power-of-two banks required")
     tree, binary, out = args.gem5_tree.resolve(), args.binary.resolve(), args.out.resolve()
-    simulator = tree / "build/X86_MOESI_D/gem5.opt"
+    simulator = args.gem5_binary or (tree / "build/X86_MOESI_D/gem5.opt")
     config = tree / "configs/deprecated/example/se.py"
     for path in [simulator, config, binary, *args.input]:
         if not path.is_file(): parser.error(f"missing file: {path}")

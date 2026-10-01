@@ -134,5 +134,15 @@ class ArtifactChecks(unittest.TestCase):
             self.assertIn(needle, seq)
 
 
+    def test_capacity_eviction_is_opt_in_and_reanalyses(self):
+        """Round 5: with the knob off a full set still rejects; with it on the
+        victim's replacement is triggered and the request stays at the head."""
+        l2 = (ROOT / "protocol/MOESI_D-L2cache.sm").read_text(encoding="utf-8")
+        self.assertIn('bool d_state_evict_for_delegate := "False";', l2)
+        i = l2.index("d_state_evict_for_delegate) {")
+        self.assertIn("trigger(Event:L2_Replacement, victim", l2[i:i + 400])
+        self.assertIn("trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);", l2[i:i + 700])
+
+
 if __name__ == "__main__":
     unittest.main()
