@@ -95,5 +95,24 @@ class ArtifactChecks(unittest.TestCase):
                       (ROOT / "protocol/MOESI_D-L1cache.sm").read_text())
 
 
+    def test_requester_combining_and_back_pressure_guards(self):
+        """Round 3: the Sequencer combines only a consecutive run of same-word
+        no-return adds, forgets the group when the L1 applies locally, and the
+        L2 parks (never drops) a request that finds the executor full."""
+        seq = (ROOT / "protocol/ruby-integration.patch").read_text(encoding="utf-8")
+        for needle in ("Sequencer::issueFront",
+                       "it->pkt->getAddr() != addr",
+                       "it->pkt->getSize() != size",
+                       "m_dstateCombined.erase(address);",
+                       "dstate_request_combine"):
+            self.assertIn(needle, seq)
+        l2 = (ROOT / "protocol/MOESI_D-L2cache.sm").read_text(encoding="utf-8")
+        self.assertIn("DState_Full", l2)
+        self.assertIn("transition({I, M, D, ILX, ILOX, OLSX}, DState_Full)", l2)
+        self.assertIn("void wakeUpAllBuffers();", l2)
+        # both executor-release actions wake the parked requests
+        self.assertEqual(l2.count("      wakeUpAllBuffers();"), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

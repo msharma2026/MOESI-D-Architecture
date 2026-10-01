@@ -65,6 +65,54 @@ Passed after the fixes (every mode CORRECT **and** through the coverage gate):
 | `scatter` ×5, `scatter_rw` ×5, `scatter_multi` 512 ×5, hot-key ×6, 800k-add `long` ×9 | every configuration × mode CORRECT with coverage; numbers in the results file |
 | `tests/check_artifact.py` 7/7 (adds the forwarding-guard and macro tests); `tests/dstate_unit.cc` (admission, interval, hot-word LRU/drop, merged arithmetic) | pass |
 
+### Round 3 (2026-10-01 build): requester-side combining and bank back-pressure
+
+Two mechanisms, both default-off: the Sequencer issues a consecutive run of
+queued same-word no-return adds as one summed request (`DSTATE_REQ_COMBINE`),
+and a request that finds the bank executor full waits for a slot instead of
+being NACKed (`DSTATE_QUEUE_STALL`). `tests/check_artifact.py` 8/8 after export;
+the built binary carries the new Sequencer code and the `DState_Full` event.
+
+A gate finding that changes how the relaxed column must be read:
+
+| Run | Binary | Knobs | Result |
+|---|---|---|---|
+| G9u | `coherence_regression` (unfenced) | relaxed + combining + back-pressure | 3/4: persistent mode aborted in a guest check |
+| G14 | unfenced | relaxed + combining, no back-pressure | persistent FAIL |
+| G13 | unfenced | relaxed + back-pressure, no combining | PASS |
+| G12 | `coherence_regression_fenced` | relaxed + combining + back-pressure | PASS |
+| G9 | `coherence_regression_fenced` | relaxed + combining + back-pressure, all four modes | **4/4** |
+
+The unfenced regression relies on TSO: its barrier and release stores are
+expected to order after the preceding adds. Under `DSTATE_RELAXED_AMO` that is
+not promised (the Intel RAO-INT contract), and requester-side combining, which
+holds queued adds a little longer, widened the window until the test observed
+the reorder. The fenced regression — the one the relaxed contract actually
+requires — passes in every mode. Consequently the round-2 result "G8 relaxed
+unfenced 4/4" was luck of timing, not evidence; the unfenced regression under
+relaxed ordering is now listed as a contract check (G9u), like litmus L7/L12.
+Under TSO, combining and back-pressure pass everything: O3 (G11) and Minor (G10)
+regressions 4/4, unfenced litmus 0 forbidden on both CPUs (L10, L13), and the
+fenced litmus under relaxed knobs 0 forbidden (L11).
+
+Performance matrices of round 3 (`results/ABLATION_2026-09-30.md`, round 3): every
+configuration × mode CORRECT with coverage, including the 8- and 16-core runs,
+the 2,048- and 8,192-line runs and the phased update/read workload.
+
+One infrastructure finding at 16 cores. With the default 32-entry endpoint
+buffers, the **conventional** (`DSTATE_ENABLED=0`) and `remote` modes of the
+phased TSO workload on 16 cores and 4 banks aborted after ~0.5 ms of simulated
+time with Garnet's `Possible network deadlock in vnet 0` (run P5), while the
+`persistent` mode and every relaxed-ordering 16-core run completed. The failing
+mode contains no delegated path at all: it is the base protocol's request traffic
+saturating finite buffers until a virtual channel stays busy for the 50,000-cycle
+detection threshold. All 16-core rows in the results therefore use 256-entry
+buffers (`DSTATE_BUFFER_SIZE=256`) in every mode, and completed; the two 32-entry
+16-core runs (P4, P5) are kept only as the record of the failure. The 4- and
+8-core rows use the default 32 entries. Whether the detector saw a true deadlock
+or starvation was not resolved (three diagnostic runs were lost to a host-side
+kill); the delegated modes are not implicated either way.
+
 ### Measurement caveats that apply to every number
 
 - **Whole-program `simSeconds`, no ROI.** `libm5` was not built, so times include
@@ -80,6 +128,8 @@ Passed after the fixes (every mode CORRECT **and** through the coverage gate):
 ### Not performed / not claimed
 
 - `gem5.debug` build; fault/interrupt ordering on either CPU.
+- Root cause of the 16-core, 32-entry-buffer deadlock report in the base protocol
+  (true deadlock vs starvation), and bank-count sweeps at 16 cores.
 - A non-deterministic or larger-window litmus for the relaxed knob: L7 shows only that
   this simulator did not reorder, not that it cannot; the contract says it may.
 - Model checking, saturation to buffer overflow, deadlock/starvation proof.

@@ -87,6 +87,8 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--require-roi", action="store_true")
     parser.add_argument("--extra", default="", help="Additional gem5 config options, saved verbatim")
+    parser.add_argument("--modes", default=",".join(MODES),
+                        help="Comma-separated subset of " + ",".join(MODES))
     args = parser.parse_args()
     if args.cores < 1 or args.banks < 1 or args.banks & (args.banks - 1) or args.repeats < 1 or args.timeout < 1:
         parser.error("positive cores/repeats/timeout and power-of-two banks required")
@@ -104,7 +106,13 @@ def main():
     env.setdefault("DSTATE_THRESHOLD", "4")
     env.setdefault("DSTATE_READ_DOWNGRADE", "3")
     failed = False
+    selected = [m.strip() for m in args.modes.split(",") if m.strip()]
+    unknown = sorted(set(selected) - set(MODES))
+    if unknown:
+        parser.error("unknown mode(s): " + ", ".join(unknown))
     for mode, settings in MODES.items():
+        if mode not in selected:
+            continue
         for repeat in range(args.repeats):
             dest = out / f"{mode}-{repeat}"
             dest.mkdir()

@@ -13,18 +13,23 @@ hardware design.
 [results](results/ABLATION_2026-09-30.md),
 and [changes since v1.0.0](docs/CHANGES.md).
 
-**Status (2026-09-30):** the branch builds and runs on gem5; directed regression
+**Status (2026-10-01):** the branch builds and runs on gem5; directed regression
 and store-ordering tests pass on O3 and Minor with the delegated path exercised
 in every mode ([validation record](docs/VALIDATION.md)). Same-binary ablations
 are in [`results/ABLATION_2026-09-30.md`](results/ABLATION_2026-09-30.md). The
 shipped one-op-per-bank admission made delegation slower than the conventional
-path. With the executor knobs below, on a 512-line scatter of 4.1M adds every
-update delegates with 7.6× fewer flits: 21% faster than the matched conventional
-path at a 20-cycle service assumption under TSO, and **3.2× faster with 5.4× fewer
-flits** when both sides use the relaxed no-return ordering of Intel RAO-INT
-(`DSTATE_RELAXED_AMO=1`) and the bank combines same-word adds. On a single
-contended line the conventional owner is still faster. Whole-program, single-run,
-sensitivity numbers on a 4-core model; not an application speedup.
+path. With the executor knobs below (bounded admission, pipelining,
+back-pressure, combining), on 512 to 8,192 hot lines every update delegates with
+about 7× fewer flits: **20–21% faster** than the matched conventional path under
+TSO at 4, 8 and 16 cores, and **3.0–3.35× faster** when both sides use the relaxed
+no-return ordering of Intel RAO-INT (`DSTATE_RELAXED_AMO=1`) — 2.3× at 16 cores,
+where four banks become the limit. On a single hot word, requester-side combining
+takes the delegated path from 37% slower to a tie at 4 cores and **1.6× faster at
+16 cores** under relaxed ordering; under TSO the owner stays ahead (+13% at 8
+cores). The retention policy (D) helps only on phased update/read workloads:
+1–7% at 4 cores and 24–33% at 16 cores over home execution without retention.
+Whole-program, single deterministic runs on a 4-bank model; not an application
+speedup.
 
 ## What changed since v1.0.0
 
@@ -116,6 +121,8 @@ ROI instrumentation and performance acceptance criteria.
 | `DSTATE_MERGE_LIMIT` | 0 | Same-word updates folded into one accepted operation (combining); 0 disables |
 | `DSTATE_DELEGATE_FROM_S` | 0 | 1: an L1 holding the line read-only delegates the update and drops its copy instead of upgrading |
 | `DSTATE_RELAXED_AMO` | 0 | 1 (O3 only): no-return atomics bypass TSO's one-store-in-flight rule, Intel RAO-INT style; fence where you publish |
+| `DSTATE_REQ_COMBINE` | 1 | Queued same-word no-return adds a core issues as one summed request once the previous request to that line completes; 1 disables |
+| `DSTATE_QUEUE_STALL` | 0 | 1: a request that finds the bank executor full waits in the input buffer for a released slot instead of being NACKed to the GETX path |
 | `DSTATE_BUFFER_SIZE` | 32 | Entries per configured endpoint/trigger buffer |
 | `DSTATE_TBES` | 16 | L1/L2 controller TBE count |
 | `DSTATE_THRESHOLD` | 4 | Saturating accepted-update count needed for promotion |

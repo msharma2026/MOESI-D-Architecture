@@ -15,7 +15,7 @@ LDLIBS ?=
 # LDLIBS=/path/to/gem5/util/m5/build/x86/out/libm5.a
 # ROI includes synchronization/final merge and excludes serial verification.
 
-DSTATE  := scatter_dstate scatter_nm scatter_multi scatter_rw spmv_dstate
+DSTATE  := scatter_dstate scatter_nm scatter_multi scatter_rw scatter_phased spmv_dstate
 BASE    := scatter_base scatter_base_nm scatter_multi_base scatter_rw_base spmv_base
 LITMUS  := litmus_dstate litmus_naive litmus_fc litmus_priv litmus_privstream
 CMS     := cms_dstate cms_naive cms_priv cms_privstream
@@ -48,6 +48,8 @@ scatter_base_nm:    scatter_nomemset.c ; $(CC) $(CPPFLAGS) $(CFLAGS) -DBASELINE 
 # --- scatter_multi: N counters on N distinct lines (working-set sweep) ----
 scatter_multi:      scatter_multi.c      ; $(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDLIBS)
 scatter_multi_base: scatter_multi_base.c ; $(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDLIBS)
+# --- scatter_phased: update phase over N lines, then every thread reads them; repeat
+scatter_phased:     scatter_phased.c     ; $(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDLIBS)
 
 # --- scatter_rw: updates interleaved with full-line reads -----------------
 scatter_rw:         scatter_rw.c      ; $(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDLIBS)

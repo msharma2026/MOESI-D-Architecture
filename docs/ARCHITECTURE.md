@@ -202,6 +202,27 @@ to the home instead of upgrading. It keeps serving forwarded reads and
 acknowledging invalidations for its copy (`D_REQ_S`, `D_RETRY_S`) until the ACK
 arrives or the fallback starts, because the L2 still lists it as a sharer.
 
+Two requester/bank mechanisms address limits that the round-2 measurements
+exposed, both default-off. **Requester-side combining** (`DSTATE_REQ_COMBINE`):
+gem5's Sequencer queues every request to a line behind the one already
+outstanding, so a core never has more than one delegated add per line in flight
+whatever the ordering mode allows. When that request completes, the Sequencer
+now issues the consecutive run of queued no-return adds to the *same word* as one
+request whose operand is their modular sum; all of them complete on its ACK.
+Only a consecutive run of identical type, address and width is combined, so the
+order of every other queued request is unchanged, and the request is still one
+operand of the original width (one 16 B or 24 B message). If the L1 applies the
+request locally instead, it executes only the front request's own functor and
+re-issues the rest, so nothing is applied twice or lost; the fallback path
+applies the saved summed operand once and completes the whole group. This is the
+delegated-path counterpart of the batching an owning core gets for free.
+**Back-pressure** (`DSTATE_QUEUE_STALL`): a request that finds the bank executor
+at capacity is parked in the finite input buffer with `stall_and_wait` and
+re-analysed when any executor slot is released, instead of being NACKed into a
+full ownership migration. Accepted operations complete through the timer and
+the response network, never through the request buffer, so the stall adds no
+new dependency to the liveness argument.
+
 Separate virtual networks and priority for completion/responses help preserve
 progress but do **not** prove deadlock freedom with finite queues. Required
 remaining work includes dependency graphs, adversarial interleavings and

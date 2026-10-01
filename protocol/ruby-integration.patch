@@ -440,7 +440,7 @@ index 0000000..f5c0388
 +} // namespace gem5::ruby
 +#endif
 diff --git a/src/mem/ruby/system/Sequencer.cc b/src/mem/ruby/system/Sequencer.cc
-index ec9b417..4767795 100644
+index ec9b417..dacbae9 100644
 --- a/src/mem/ruby/system/Sequencer.cc
 +++ b/src/mem/ruby/system/Sequencer.cc
 @@ -42,6 +42,7 @@
@@ -451,7 +451,53 @@ index ec9b417..4767795 100644
  #include "cpu/testers/rubytest/RubyTester.hh"
  #include "debug/LLSC.hh"
  #include "debug/ProtocolTrace.hh"
-@@ -695,6 +696,36 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
+@@ -72,6 +73,7 @@ Sequencer::Sequencer(const Params &p)
+ 
+     m_dataCache_ptr = p.dcache;
+     m_max_outstanding_requests = p.max_outstanding_requests;
++    m_dstateRequestCombine = p.dstate_request_combine;
+     m_deadlock_threshold = p.deadlock_threshold;
+ 
+     m_coreId = p.coreid; // for tracking the two CorePair sequencers
+@@ -494,7 +496,7 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
+             // Do not process follow-up requests
+             // (e.g. if full line no present)
+             // Reissue to the cache hierarchy
+-            issueRequest(seq_req.pkt, seq_req.m_second_type);
++            issueFront(address, seq_req_list);
+             break;
+         }
+ 
+@@ -587,7 +589,8 @@ Sequencer::processReadCallback(SequencerRequest &seq_req,
+         (seq_req.m_type != RubyRequestType_IFETCH) &&
+         (seq_req.m_type != RubyRequestType_REPLACEMENT)) {
+         // Write request: reissue request to the cache hierarchy
+-        issueRequest(seq_req.pkt, seq_req.m_second_type);
++        const Addr line = makeLineAddress(seq_req.pkt->getAddr());
++        issueFront(line, m_RequestTable[line]);
+         return true;
+     }
+     return false;
+@@ -655,6 +658,9 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
+     assert(address == makeLineAddress(address));
+     assert(m_RequestTable.find(address) != m_RequestTable.end());
+     auto &seq_req_list = m_RequestTable[address];
++    // Applied locally: only the front request's own functor is executed below,
++    // so a combined operand sent with it is void and the others are re-issued.
++    m_dstateCombined.erase(address);
+ 
+     // Perform hitCallback only on the first cpu request that
+     // issued the ruby request
+@@ -674,7 +680,7 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
+             // Read, Write or Atomic request:
+             // reissue request to the cache hierarchy
+             // (we don't know if op was performed remotly)
+-            issueRequest(seq_req.pkt, seq_req.m_second_type);
++            issueFront(address, seq_req_list);
+             break;
+         }
+ 
+@@ -695,6 +701,104 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
      }
  }
  
@@ -464,31 +510,99 @@ index ec9b417..4767795 100644
 +    panic_if(it == m_RequestTable.end() || it->second.empty(),
 +             "Delegated atomic completed without an outstanding request");
 +    auto &requests = it->second;
-+    auto &request = requests.front();
-+    panic_if(request.m_type != RubyRequestType_ATOMIC_NO_RETURN,
-+             "Remote completion is only valid for a no-return atomic");
 +    panic_if(m_usingRubyTester || m_ruby_system->getWarmupEnabled() ||
 +             m_ruby_system->getCooldownEnabled(),
 +             "MOESI-D remote completion requires the supported timing-CPU mode");
-+    PacketPtr pkt = request.pkt;
-+    recordMissLatency(&request, true, MachineType_NUM, true,
-+                      Cycles(0), Cycles(0), Cycles(0));
++    // One ACK completes every CPU request that the outstanding (possibly
++    // combined, see issueFront) request carried: the home applied their sum.
++    int count = 1;
++    auto cit = m_dstateCombined.find(address);
++    if (cit != m_dstateCombined.end()) {
++        count = cit->second;
++        m_dstateCombined.erase(cit);
++    }
++    panic_if(count < 1 || count > int(requests.size()),
++             "Combined no-return atomic covers more requests than are queued");
++    std::vector<PacketPtr> completed;
++    for (int i = 0; i < count; ++i) {
++        auto &request = requests.front();
++        panic_if(request.m_type != RubyRequestType_ATOMIC_NO_RETURN,
++                 "Remote completion is only valid for a no-return atomic");
++        recordMissLatency(&request, true, MachineType_NUM, true,
++                          Cycles(0), Cycles(0), Cycles(0));
++        markRemoved();
++        completed.push_back(request.pkt);
++        requests.pop_front();
++    }
 +    llscClearMonitor(address);
-+    markRemoved();
-+    requests.pop_front();
 +    if (requests.empty()) {
 +        m_RequestTable.erase(it);
 +    } else {
-+        issueRequest(requests.front().pkt, requests.front().m_second_type);
++        issueFront(address, requests);
 +    }
-+    ruby_hit_callback(pkt);
++    for (PacketPtr pkt : completed) {
++        ruby_hit_callback(pkt);
++    }
 +    testDrainComplete();
++}
++
++void
++Sequencer::issueFront(Addr line, std::list<SequencerRequest> &requests)
++{
++    // MOESI-D requester-side combining. A CPU that may keep several no-return
++    // adds in flight (relaxed ordering, or an in-order store buffer) queues
++    // them here behind the one outstanding request to their line. When that
++    // request completes, the consecutive same-word adds at the front of the
++    // list are issued as ONE request whose operand is their modular sum; all
++    // of them complete on its ACK (atomicRemoteCallback). Only a consecutive
++    // run of the same type, address and width is combined, so ordering with
++    // respect to every other queued request is unchanged, and the request is
++    // still a single operand of the original width. If the L1 applies the
++    // request locally instead, atomicCallback applies the front request's own
++    // functor and re-issues the rest, so nothing is applied twice or lost.
++    assert(!requests.empty());
++    SequencerRequest &front = requests.front();
++    m_dstateCombined.erase(line);
++    if (m_dstateRequestCombine <= 1 ||
++        front.m_type != RubyRequestType_ATOMIC_NO_RETURN ||
++        !front.pkt->isAtomicOp()) {
++        issueRequest(front.pkt, front.m_second_type);
++        return;
++    }
++    const Addr addr = front.pkt->getAddr();
++    const int size = front.pkt->getSize();
++    uint64_t sum = 0;
++    int count = 0;
++    for (auto it = requests.begin();
++         it != requests.end() && count < m_dstateRequestCombine; ++it) {
++        if (it->m_type != RubyRequestType_ATOMIC_NO_RETURN ||
++            !it->pkt->isAtomicOp() || it->pkt->getAddr() != addr ||
++            it->pkt->getSize() != size) {
++            break;
++        }
++        auto *add32 = dynamic_cast<AtomicOpAdd<uint32_t> *>(it->pkt->getAtomicOp());
++        auto *add64 = dynamic_cast<AtomicOpAdd<uint64_t> *>(it->pkt->getAtomicOp());
++        if (!((size == 4 && add32) || (size == 8 && add64))) {
++            break;
++        }
++        sum += size == 4 ? uint64_t(add32->a) : add64->a;
++        ++count;
++    }
++    if (count <= 1) {
++        issueRequest(front.pkt, front.m_second_type);
++        return;
++    }
++    if (size == 4) {
++        sum &= 0xffffffffULL;
++    }
++    m_dstateCombined[line] = count;
++    issueRequest(front.pkt, front.m_second_type, true, sum);
 +}
 +
  void
  Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
                         bool llscSuccess,
-@@ -1009,7 +1040,7 @@ Sequencer::makeRequest(PacketPtr pkt)
+@@ -1009,7 +1113,7 @@ Sequencer::makeRequest(PacketPtr pkt)
      } else if (pkt->req->isTlbiCmd()) {
          primary_type = secondary_type = tlbiCmdToRubyRequestType(pkt);
          DPRINTF(RubySequencer, "Issuing TLBI\n");
@@ -497,7 +611,17 @@ index ec9b417..4767795 100644
      } else if (pkt->isAtomicOp()) {
          if (pkt->req->isAtomicReturn()){
              DPRINTF(RubySequencer, "Issuing ATOMIC RETURN \n");
-@@ -1152,6 +1183,24 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
+@@ -1087,7 +1191,8 @@ Sequencer::makeRequest(PacketPtr pkt)
+ }
+ 
+ void
+-Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
++Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type,
++                        bool combined, uint64_t combinedOperand)
+ {
+     assert(pkt != NULL);
+     ContextID proc_id = pkt->req->hasContextId() ?
+@@ -1152,6 +1257,25 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
                                  (offset, pkt->getAtomicOp()));
  
              msg->setWriteMask(offset, pkt->getSize(), atomicOps);
@@ -512,7 +636,8 @@ index ec9b417..4767795 100644
 +                panic_if(!((size == 4 && add32) || (size == 8 && add64)) ||
 +                         offset % size || offset + size > blk_size,
 +                         "MOESI-D supports only aligned ADD32/ADD64 timing requests");
-+                uint64_t operand = size == 4 ? uint64_t(add32->a) : add64->a;
++                uint64_t operand = combined ? combinedOperand
++                                   : (size == 4 ? uint64_t(add32->a) : add64->a);
 +                uint8_t encoded[8] = {};
 +                for (int byte = 0; byte < size; ++byte)
 +                    encoded[byte] = uint8_t(operand >> (8 * byte));
@@ -523,7 +648,7 @@ index ec9b417..4767795 100644
  
          DPRINTFR(ProtocolTrace, "%15s %3s %10s%20s %6s>%-6s %#x %s\n",
 diff --git a/src/mem/ruby/system/Sequencer.hh b/src/mem/ruby/system/Sequencer.hh
-index f530eb4..f2375bb 100644
+index f530eb4..ae76724 100644
 --- a/src/mem/ruby/system/Sequencer.hh
 +++ b/src/mem/ruby/system/Sequencer.hh
 @@ -125,6 +125,8 @@ class Sequencer : public RubyPort
@@ -535,3 +660,44 @@ index f530eb4..f2375bb 100644
      void atomicCallback(Addr address,
                          DataBlock& data,
                          const bool externalHit = false,
+@@ -210,7 +212,11 @@ class Sequencer : public RubyPort
+     { return m_IncompleteTimes[t]; }
+ 
+   protected:
+-    void issueRequest(PacketPtr pkt, RubyRequestType type);
++    void issueRequest(PacketPtr pkt, RubyRequestType type,
++                      bool combined = false, uint64_t combinedOperand = 0);
++    // Issue the request at the front of a line's list, combining a consecutive
++    // run of same-word no-return adds into one request (MOESI-D).
++    void issueFront(Addr line, std::list<SequencerRequest> &requests);
+     virtual void hitCallback(SequencerRequest* srequest, DataBlock& data,
+                              bool llscSuccess,
+                              const MachineType mach, const bool externalHit,
+@@ -242,6 +248,11 @@ class Sequencer : public RubyPort
+   protected:
+     // RequestTable contains both read and write requests, handles aliasing
+     std::unordered_map<Addr, std::list<SequencerRequest>> m_RequestTable;
++    // MOESI-D requester-side combining (see issueFront): the maximum number of
++    // queued same-word no-return adds issued as one request, and per line the
++    // number of CPU requests covered by the outstanding combined request.
++    int m_dstateRequestCombine = 1;
++    std::unordered_map<Addr, int> m_dstateCombined;
+     // UnadressedRequestTable contains "unaddressed" requests,
+     // guaranteed not to alias each other
+     std::unordered_map<uint64_t, SequencerRequest> m_UnaddressedRequestTable;
+diff --git a/src/mem/ruby/system/Sequencer.py b/src/mem/ruby/system/Sequencer.py
+index 49c6374..7f912c8 100644
+--- a/src/mem/ruby/system/Sequencer.py
++++ b/src/mem/ruby/system/Sequencer.py
+@@ -96,6 +96,11 @@ class RubySequencer(RubyPort):
+     max_outstanding_requests = Param.Int(
+         16, "max requests (incl. prefetches) outstanding"
+     )
++    # MOESI-D: queued same-word no-return adds issued as one summed request
++    # when the previous request to that line completes. 1 disables combining.
++    dstate_request_combine = Param.Int(
++        1, "max no-return adds to one word combined into one request"
++    )
+     deadlock_threshold = Param.Cycles(
+         500000,
+         "max outstanding cycles for a request "

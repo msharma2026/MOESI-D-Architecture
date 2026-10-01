@@ -59,6 +59,10 @@ machine(MachineType:L2Cache, "Token protocol")
   int d_state_queue_depth := 1;
   Cycles d_state_init_interval := 42;
   bool d_state_busy_stall := "False";
+  // Back-pressure: when the executor is at capacity, park the request in the
+  // finite input buffer and wake it when a slot is released, instead of NACKing
+  // it into a full ownership migration. Default off (reject, as shipped).
+  bool d_state_queue_stall := "False";
   //   hit_latency   service time when the target word is in the bank's hot-word
   //                 buffer (registers, not the SRAM array); default = full latency
   //   hotwords      hot-word buffer entries per bank; 0 disables the model
@@ -187,6 +191,7 @@ machine(MachineType:L2Cache, "Token protocol")
   enumeration(Event, desc="Cache events") {
     DState_Reject, desc="Pre-acceptance rejection: no mutation or future execution";
     DState_Busy, desc="Line is acquiring or executing another update; wait, do not reject";
+    DState_Full, desc="Executor at capacity; wait for a released slot instead of rejecting";
     DState_Merge, desc="Same-word update folded into the pending accepted operation";
     DState_CompleteMerged, desc="Service time elapsed for an operation with merged requesters";
     DState_AckMore, desc="Acknowledge the next merged requester";
@@ -307,6 +312,7 @@ machine(MachineType:L2Cache, "Token protocol")
   void unset_tbe();
   MachineID mapAddressToMachine(Addr addr, MachineType mtype);
   void wakeUpAllBuffers(Addr a);
+  void wakeUpAllBuffers();
 
   // Latency for responses that fetch data from cache
   Cycles cacheResponseLatency() {
@@ -900,6 +906,9 @@ machine(MachineType:L2Cache, "Token protocol")
             trigger(Event:DState_Merge, in_msg.addr, ce, TBEs[in_msg.addr]);
           } else if (busy && d_state_busy_stall) {
             trigger(Event:DState_Busy, in_msg.addr, ce, TBEs[in_msg.addr]);
+          } else if (owner_ok && d_state_queue_stall &&
+                     dStateEngine.hasCapacity(d_state_queue_depth) == false) {
+            trigger(Event:DState_Full, in_msg.addr, ce, TBEs[in_msg.addr]);
           } else if (owner_ok == false ||
               dStateEngine.hasCapacity(d_state_queue_depth) == false ||
               TBEs.areNSlotsAvailable(1, clockEdge()) == false) {
@@ -1889,12 +1898,20 @@ machine(MachineType:L2Cache, "Token protocol")
   action(d_finish, "dfinish", desc="Release the executor after the ACK was queued") {
     dStateTimer.unset(address);
     dStateEngine.release();
+    if (d_state_queue_stall) {
+      // A slot is free: re-analyse requests parked by DState_Full (any line).
+      wakeUpAllBuffers();
+    }
   }
   action(d_unsetTimer, "dtimeroff", desc="Service complete; the merged-requester ACKs follow via the trigger queue") {
     dStateTimer.unset(address);
   }
   action(d_releaseEngine, "drelease", desc="Release the executor after the last merged ACK was queued") {
     dStateEngine.release();
+    if (d_state_queue_stall) {
+      // A slot is free: re-analyse requests parked by DState_Full (any line).
+      wakeUpAllBuffers();
+    }
   }
   action(d_ackNextMerged, "dackm", desc="Acknowledge one merged requester with its own transaction ID") {
     assert(is_valid(tbe));
@@ -3301,6 +3318,11 @@ machine(MachineType:L2Cache, "Token protocol")
               ILOD, ILOSD, ILOSW, ILOSXD, ILOSXW, ILOW, ILOXD, ILOXW, ILSI, ILSW, ILXD, ILXW,
               ISFGS, IW, MI, MII, MM, OGMIO, OGMIOF, OI, OLSF, OLSI, OLSS, OLSW, OLSXS, OLSXW,
               OO, OW, OXW, SLSS, SLSW, SS, SW}, DState_Busy) {
+    st_stallAndWaitL1RequestQueue;
+  }
+
+  // Executor full in an accepting state: wait for a released slot.
+  transition({I, M, D, ILX, ILOX, OLSX}, DState_Full) {
     st_stallAndWaitL1RequestQueue;
   }
 

@@ -106,6 +106,10 @@ def create_system(
     # 0 selects "equal to the service latency", i.e. no pipelining.
     init_interval = bounded_env("DSTATE_INIT_INTERVAL", "0", 0, 65535) or exec_latency
     busy_stall = flag_env("DSTATE_BUSY_STALL", "0")
+    # Back-pressure instead of NACK when the bank executor is full.
+    queue_stall = flag_env("DSTATE_QUEUE_STALL", "0")
+    # Requester-side combining: queued same-word adds per issued request (1 = off).
+    req_combine = bounded_env("DSTATE_REQ_COMBINE", "1", 1, 64)
     # Service-model and combining knobs (all default to the shipped behaviour).
     # 0 hit latency selects "equal to the service latency" (no hot-word benefit).
     hit_latency = bounded_env("DSTATE_HIT_LATENCY", "0", 0, 65535) or exec_latency
@@ -172,6 +176,7 @@ def create_system(
         )
 
         cpu_seq = RubySequencer(
+            dstate_request_combine=req_combine,
             version=i,
             dcache=l1d_cache,
             clk_domain=clk_domain,
@@ -242,6 +247,7 @@ def create_system(
             d_state_queue_depth=queue_depth,
             d_state_init_interval=init_interval,
             d_state_busy_stall=busy_stall,
+            d_state_queue_stall=queue_stall,
             d_state_hit_latency=hit_latency,
             d_state_hotwords=hotwords,
             d_state_merge_limit=merge_limit,

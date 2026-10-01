@@ -98,6 +98,19 @@ Round-two mechanisms, each a knob defaulting off, layered on the last row:
 | from-S | `+ DSTATE_DELEGATE_FROM_S=1` | an L1 holding the line read-only delegates and drops its copy |
 | hot32 variants | `DSTATE_HOTWORDS=32` in place of 8 | buffer sized to cover the 32-counter working set; used for the hot-key and 800k-add `long` rows |
 
+Round-three mechanisms, layered on the round-two columns (`ablate.sh v3`):
+
+| Column | Adds | Models |
+|---|---|---|
+| back-pressure | `DSTATE_QUEUE_STALL=1` | a request that finds the executor full waits for a slot instead of falling back to GETX |
+| requester combining | `DSTATE_REQ_COMBINE=16` | queued same-word adds from one core issued as one summed request; only reachable when the core keeps several adds in flight |
+| deeper executor | `DSTATE_QUEUE_DEPTH=16 DSTATE_MERGE_LIMIT=64` | sensitivity points for the two queues |
+
+`run_matrix.py --modes` selects a subset of the four modes; `ablate.sh v3 scale`
+uses `local,remote,persistent` at 8 and 16 cores, and `v3 phased` runs
+`bench/scatter_phased` (update every line, then every thread reads every line,
+repeated), the read/update-phase workload the retention policy is for.
+
 `DSTATE_RELAXED_AMO` changes the CPU, not the protocol, and `run_matrix.py` applies
 it to the `local` mode as well; a relaxed row's baseline is the relaxed `local` row.
 Single-line runs of 8,000 adds are dominated by process start-up (~150 µs); the

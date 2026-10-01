@@ -33,12 +33,12 @@ KN_FULL="DSTATE_QUEUE_DEPTH=8 DSTATE_INIT_INTERVAL=4 DSTATE_BUSY_STALL=1"
 matrix() { local name=$1 bin=$2 args=$3 cores=$4 cpu=$5; shift 5
   [ -d "$OUT/$name" ] && { echo "$name: exists, skipping"; return; }
   env "$@" python3 "$SRC/tools/run_matrix.py" --gem5-tree "$TREE" --binary "$W/bench/$bin" --workload-args "$args" \
-      --out "$OUT/$name" --cores "$cores" --banks 4 --cpu "$cpu" --repeats 1 --timeout 2400 > "$OUT/$name.log" 2>&1
-  printf "%-34s %s/4 modes pass  %s\n" "$name" "$(grep -cE ' PASS$' "$OUT/$name.log")" "$(grep -E ' FAIL' "$OUT/$name.log" | tr '\n' ' ')"; }
+      --out "$OUT/$name" --cores "$cores" --banks 4 --cpu "$cpu" --repeats 1 --timeout "${TIMEOUT:-2400}" --modes "${MODES:-local,remote,persistent,forced-nack}" > "$OUT/$name.log" 2>&1
+  printf "%-34s %s/%s modes pass  %s\n" "$name" "$(grep -cE ' PASS$' "$OUT/$name.log")" "$(echo "${MODES:-local,remote,persistent,forced-nack}" | tr ',' '\n' | wc -l)" "$(grep -E ' FAIL' "$OUT/$name.log" | tr '\n' ' ')"; }
 # direct gem5 run for the ordering litmus (prints PASS/FAIL, not CORRECT)
 litmus() { local name=$1 bin=$2; shift 2
   [ -d "$OUT/$name" ] && { echo "$name: exists, skipping"; return; }
-  env "$@" "$GEM5" --outdir="$OUT/$name" "$SE" $COMMON --cpu-type=X86O3CPU --num-cpus=2 -c "$W/bench/$bin" > "$OUT/$name.log" 2>&1
+  env "$@" "$GEM5" --outdir="$OUT/$name" "$SE" $COMMON --cpu-type="${LITMUS_CPU:-X86O3CPU}" --num-cpus=2 -c "$W/bench/$bin" > "$OUT/$name.log" 2>&1
   printf "%-34s %s\n" "$name" "$(grep -E 'variant=|^PASS|^FAIL|LOST|panic:|fatal:' "$OUT/$name.log" | tr '\n' '|' | cut -c1-140)"; }
 
 case ${1:-help} in
@@ -154,6 +154,103 @@ v2)
     matrix K8_rw800k_hot32_merge_relaxed      scatter_rw     "4 200000 32 8" 4 X86O3CPU $KN_HOT32MR &
     wait ;;
   esac ;;
+v3)
+  # Round three: requester-side combining (DSTATE_REQ_COMBINE: queued same-word adds
+  # from one core issued as one summed request) and bank back-pressure
+  # (DSTATE_QUEUE_STALL: wait for an executor slot instead of NACKing). Both are
+  # CPU/bank mechanisms on top of the round-2 knobs. Columns:
+  #   T  = TSO,      20-cycle service, no hot-word buffer   (round-2 best TSO + new knobs)
+  #   TH = TSO,      42-cycle service, 32 hot words          (single-line TSO comparison)
+  #   R  = relaxed,  42/4-cycle service, 32 hot words        (round-2 best relaxed + new knobs)
+  #   usage: ablate.sh v3 gates|perf|ws|scale|phased
+  KN_V3="DSTATE_QUEUE_DEPTH=16 DSTATE_INIT_INTERVAL=4 DSTATE_BUSY_STALL=1 DSTATE_QUEUE_STALL=1 DSTATE_REQ_COMBINE=16 DSTATE_MERGE_LIMIT=64"
+  KN_V3T="$KN_V3 DSTATE_EXEC_LATENCY=20"
+  KN_V3TH="$KN_V3 DSTATE_HOTWORDS=32 DSTATE_HIT_LATENCY=4"
+  KN_V3R="$KN_V3TH DSTATE_RELAXED_AMO=1"
+  PERF3="local,remote,persistent"
+  KN_HOT="$KN_FULL DSTATE_HOTWORDS=8 DSTATE_HIT_LATENCY=4"; KN_HOTM="$KN_HOT DSTATE_MERGE_LIMIT=8"; KN_HOTMR="$KN_HOTM DSTATE_RELAXED_AMO=1"
+  case ${2:-all} in
+  gates)
+    # Relaxed column: the FENCED regression is the gate. The unfenced one (G9u) is a
+    # contract check only: its barrier/release stores may overtake an in-flight add
+    # under relaxed ordering, and requester combining widens that window.
+    matrix G9_regress_v3R_fenced_o3   coherence_regression_fenced "" 5 X86O3CPU $KN_V3R &
+    matrix G9u_regress_v3R_unfenced_o3 coherence_regression       "" 5 X86O3CPU $KN_V3R &
+    matrix G10_regress_v3T_minor  coherence_regression "" 5 X86MinorCPU $KN_V3TH &
+    matrix G11_regress_v3T_o3     coherence_regression "" 5 X86O3CPU    $KN_V3T  &
+    wait
+    # L10/L13 (TSO, unfenced) must pass: combining may not reorder a flag store past the adds.
+    # L11 (fenced, relaxed) must pass. L12 is the relaxed contract check (may reorder).
+    litmus L10_litmus_unfenced_v3T        ordering_litmus        DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_V3T &
+    litmus L11_litmus_fenced_v3R          ordering_litmus_fenced DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_V3R &
+    litmus L12_litmus_unfenced_v3R_RELAXED ordering_litmus       DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_V3R &
+    LITMUS_CPU=X86MinorCPU litmus L13_litmus_unfenced_v3T_minor ordering_litmus DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_V3TH &
+    wait ;;
+  perf)
+    # 512 lines: isolate back-pressure (W1) and combining (W2) on the round-2 relaxed
+    # best, then everything (W3); W0 is the TSO column.
+    matrix W0_multi512_v3T               scatter_multi "4 2000 512" 4 X86O3CPU $KN_V3T &
+    matrix W1_multi512_hotmerge_relaxed_qstall scatter_multi "4 2000 512" 4 X86O3CPU $KN_HOTMR DSTATE_QUEUE_STALL=1 &
+    matrix W2_multi512_hotmerge_relaxed_combine scatter_multi "4 2000 512" 4 X86O3CPU $KN_HOTMR DSTATE_REQ_COMBINE=16 DSTATE_QUEUE_DEPTH=16 &
+    matrix W3_multi512_v3R               scatter_multi "4 2000 512" 4 X86O3CPU $KN_V3R &
+    wait
+    # single line, 800k adds: the regime requester-side combining is for
+    matrix X0_hotkey800k_v3TH            scatter_dstate "4 200000 1"    4 X86O3CPU $KN_V3TH &
+    matrix X1_hotkey800k_v3R             scatter_dstate "4 200000 1"    4 X86O3CPU $KN_V3R &
+    matrix X2_scatter800k_v3R            scatter_dstate "4 200000 32"   4 X86O3CPU $KN_V3R &
+    matrix X3_rw800k_v3T                 scatter_rw     "4 200000 32 8" 4 X86O3CPU $KN_V3T &
+    wait
+    matrix X4_rw800k_v3R                 scatter_rw     "4 200000 32 8" 4 X86O3CPU $KN_V3R &
+    matrix X5_hotkey800k_v3R_combine64   scatter_dstate "4 200000 1"    4 X86O3CPU $KN_V3R DSTATE_REQ_COMBINE=64 &
+    wait ;;
+  ws)
+    # working set at 4 cores, op count held at 4.096M
+    MODES=$PERF3 matrix Y0_multi2048_v3T  scatter_multi "4 500 2048" 4 X86O3CPU $KN_V3T &
+    MODES=$PERF3 matrix Y1_multi2048_v3R  scatter_multi "4 500 2048" 4 X86O3CPU $KN_V3R &
+    MODES=$PERF3 matrix Y2_multi8192_v3T  scatter_multi "4 125 8192" 4 X86O3CPU $KN_V3T &
+    MODES=$PERF3 matrix Y3_multi8192_v3R  scatter_multi "4 125 8192" 4 X86O3CPU $KN_V3R &
+    wait ;;
+  scale)
+    # 8 and 16 cores, 4 banks; adds held constant (512 lines: 4.096M; single line: 800k)
+    export TIMEOUT=7200
+    MODES=$PERF3 matrix Z0_multi512_8c_v3T   scatter_multi  "8 1000 512"   8 X86O3CPU $KN_V3T &
+    MODES=$PERF3 matrix Z1_multi512_8c_v3R   scatter_multi  "8 1000 512"   8 X86O3CPU $KN_V3R &
+    MODES=$PERF3 matrix Z2_hotkey800k_8c_v3R scatter_dstate "8 100000 1"   8 X86O3CPU $KN_V3R &
+    wait
+    MODES=$PERF3 matrix Z3_hotkey800k_8c_v3TH scatter_dstate "8 100000 1"  8 X86O3CPU $KN_V3TH &
+    MODES=$PERF3 matrix Z4_rw800k_8c_v3T     scatter_rw     "8 100000 32 8" 8 X86O3CPU $KN_V3T &
+    MODES=$PERF3 matrix Z5_rw800k_8c_v3R     scatter_rw     "8 100000 32 8" 8 X86O3CPU $KN_V3R &
+    wait
+    # 16 cores on 4 banks: with the default 32-entry endpoint buffers the BASE protocol
+    # (conventional mode, no delegation) trips Garnet's deadlock detector on the request
+    # vnet under TSO. Every 16-core row therefore uses 256-entry buffers (BUF16), in all
+    # modes alike; see docs/VALIDATION.md.
+    BUF16="DSTATE_BUFFER_SIZE=${BUF16:-256}"
+    MODES=$PERF3 matrix Z6_multi512_16c_v3T   scatter_multi  "16 500 512"   16 X86O3CPU $KN_V3T $BUF16 &
+    MODES=$PERF3 matrix Z7_multi512_16c_v3R   scatter_multi  "16 500 512"   16 X86O3CPU $KN_V3R $BUF16 &
+    wait
+    MODES=$PERF3 matrix Z8_hotkey800k_16c_v3R scatter_dstate "16 50000 1"   16 X86O3CPU $KN_V3R $BUF16 &
+    MODES=$PERF3 matrix Z9_rw800k_16c_v3R     scatter_rw     "16 50000 32 8" 16 X86O3CPU $KN_V3R $BUF16 &
+    wait
+    MODES=$PERF3 matrix Z10_phased512_16c_v3T scatter_phased "16 25 512 8"  16 X86O3CPU $KN_V3T $BUF16 &
+    MODES=$PERF3 matrix Z11_phased512_16c_v3R scatter_phased "16 25 512 8"  16 X86O3CPU $KN_V3R $BUF16 &
+    wait ;;
+  phased)
+    # update phase over N lines, then every thread reads every line; repeat. The
+    # read phases are what the D retention policy is for: persistent vs remote.
+    MODES=$PERF3 matrix P0_phased512_v3T    scatter_phased "4 50 512 8"   4 X86O3CPU $KN_V3T &
+    MODES=$PERF3 matrix P1_phased512_v3R    scatter_phased "4 50 512 8"   4 X86O3CPU $KN_V3R &
+    MODES=$PERF3 matrix P2_phased32_v3R     scatter_phased "4 5000 32 8"  4 X86O3CPU $KN_V3R &
+    MODES=$PERF3 matrix P3_phased512_default scatter_phased "4 50 512 8"  4 X86O3CPU &
+    wait
+    # P4/P5 ran 16 cores with the default 32-entry buffers: P5's conventional and remote
+    # modes hit the Garnet deadlock detector (see VALIDATION.md). The 16-core phased rows
+    # that count are Z10/Z11 in `scale`, which use 256-entry buffers in every mode.
+    export TIMEOUT=7200
+    MODES=$PERF3 matrix P4_phased512_16c_v3R scatter_phased "16 25 512 8" 16 X86O3CPU $KN_V3R &
+    MODES=$PERF3 matrix P5_phased512_16c_v3T scatter_phased "16 25 512 8" 16 X86O3CPU $KN_V3T &
+    wait ;;
+  esac ;;
 report)
   # One row per (run, mode). Update/response message counts come from the L1's terminal
   # ACK/NACK counters (Garnet emits no per-size-class msg_count); newBytes uses the derived
@@ -179,5 +276,5 @@ report)
              n, mode, s, fl, pk, r, b, c, h, k+km, mg, km, u32, rs }' "$m/stats.txt"
     done
   done ;;
-*) echo "usage: GEM5_TREE=... OUT=... $0 gates|perf|rw|multi|final|report | v2 gates|scatter|rw|multi|hotkey|long" ;;
+*) echo "usage: GEM5_TREE=... OUT=... $0 gates|perf|rw|multi|final|report | v2 gates|scatter|rw|multi|hotkey|long | v3 gates|perf|ws|scale|phased" ;;
 esac

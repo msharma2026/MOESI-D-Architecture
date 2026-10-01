@@ -55,7 +55,14 @@ holds, what changed in the implementation, and where the current evidence is.
   The LSQ never forwards an atomic request's operand to a younger load.
 - `DSTATE_RELAXED_AMO=1` (O3) applies the weaker ordering documented for Intel
   RAO-INT: no-return adds may overlap one another and later stores; software
-  fences where it publishes.
+  fences where it publishes. Correctness tests for that mode use the fenced
+  guest binaries; the unfenced ones are contract checks that may observe the
+  permitted reorder.
+- `DSTATE_REQ_COMBINE`: the Sequencer issues queued same-word no-return adds
+  from one core as a single summed request once the previous request to that
+  line completes; all of them complete on its ACK. Only a consecutive run of
+  identical type, address and width is combined, so ordering with respect to
+  every other queued request is unchanged.
 
 ### Rejection and fallback
 - A bank that cannot accept an update replies with a NACK *before* acceptance.
@@ -74,7 +81,8 @@ holds, what changed in the implementation, and where the current evidence is.
   for a 64-bit update, 8 B for a terminal ACK/NACK.
 - Bank-side mechanisms, each off by default: a hot-word buffer, same-word
   combining with one ACK per combined requester, waiting instead of rejecting
-  when the line is busy, and delegation from a read-only L1 copy. See the
+  when the line is busy or when the executor is full (`DSTATE_QUEUE_STALL`),
+  and delegation from a read-only L1 copy. See the
   [configuration table](../README.md#configuration).
 
 ### Controls and build

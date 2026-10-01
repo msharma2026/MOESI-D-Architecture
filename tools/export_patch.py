@@ -28,6 +28,7 @@ RUBY = [
     "src/mem/ruby/protocol/RubySlicc_Types.sm",
     "src/mem/ruby/system/Sequencer.cc",
     "src/mem/ruby/system/Sequencer.hh",
+    "src/mem/ruby/system/Sequencer.py",
 ]
 # O3 CPU: store-class no-return atomics must not forward their delta to younger
 # loads, and the optional relaxed (RAO-INT style) ordering knob. Shipped inside

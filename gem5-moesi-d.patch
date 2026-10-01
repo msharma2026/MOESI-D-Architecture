@@ -1,9 +1,9 @@
 diff --git a/bench/Makefile b/bench/Makefile
 new file mode 100644
-index 0000000..725f2d6
+index 0000000..46b3776
 --- /dev/null
 +++ b/bench/Makefile
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,78 @@
 +# Benchmarks for MOESI-D evaluation.
 +#
 +# Built statically for x86-64 gem5 SE mode. Scatter/SpMV use OpenMP;
@@ -21,7 +21,7 @@ index 0000000..725f2d6
 +# LDLIBS=/path/to/gem5/util/m5/build/x86/out/libm5.a
 +# ROI includes synchronization/final merge and excludes serial verification.
 +
-+DSTATE  := scatter_dstate scatter_nm scatter_multi scatter_rw spmv_dstate
++DSTATE  := scatter_dstate scatter_nm scatter_multi scatter_rw scatter_phased spmv_dstate
 +BASE    := scatter_base scatter_base_nm scatter_multi_base scatter_rw_base spmv_base
 +LITMUS  := litmus_dstate litmus_naive litmus_fc litmus_priv litmus_privstream
 +CMS     := cms_dstate cms_naive cms_priv cms_privstream
@@ -54,6 +54,8 @@ index 0000000..725f2d6
 +# --- scatter_multi: N counters on N distinct lines (working-set sweep) ----
 +scatter_multi:      scatter_multi.c      ; $(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDLIBS)
 +scatter_multi_base: scatter_multi_base.c ; $(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDLIBS)
++# --- scatter_phased: update phase over N lines, then every thread reads them; repeat
++scatter_phased:     scatter_phased.c     ; $(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDLIBS)
 +
 +# --- scatter_rw: updates interleaved with full-line reads -----------------
 +scatter_rw:         scatter_rw.c      ; $(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDLIBS)
@@ -1153,6 +1155,53 @@ index 0000000..e72b57e
 +
 +    return correct ? 0 : 2;
 +}
+diff --git a/bench/scatter_phased.c b/bench/scatter_phased.c
+new file mode 100644
+index 0000000..3e50617
+--- /dev/null
++++ b/bench/scatter_phased.c
+@@ -0,0 +1,41 @@
++/* Phased update/read microbenchmark: the workload the D (retention) policy is
++ * for. In each phase every thread adds 1 to every one of N lines (its own
++ * 128 B line each), then every thread reads every line. Reads pull each line
++ * into the readers' L1s; the next update phase measures whether retaining the
++ * home copy (persistent mode) beats re-acquiring it (remote mode). */
++#include "dstate_ops.h"
++#include <string.h>
++#include <omp.h>
++typedef struct { int32_t v; char pad[124]; } line_t;
++#define MAXN 16384
++static line_t ctr[MAXN] __attribute__((aligned(128)));
++int main(int argc, char **argv) {
++    if (argc != 5) {
++        fprintf(stderr, "usage: %s threads iters lines phases\n", argv[0]);
++        return 1;
++    }
++    int th = bench_int(argv[1], 1, 64);
++    int it = bench_int(argv[2], 1, 1 << 20);
++    int nl = bench_int(argv[3], 1, MAXN);
++    int ph = bench_int(argv[4], 1, 1 << 10);
++    omp_set_dynamic(0); omp_set_num_threads(th);
++    memset(ctr, 0, (size_t)nl * sizeof(*ctr));
++    long long sink = 0;
++    bench_roi_begin();
++    for (int p = 0; p < ph; ++p) {
++        #pragma omp parallel
++        { for (int i = 0; i < it; ++i) for (int k = 0; k < nl; ++k) dstate_add32(&ctr[k].v, 1); }
++        /* implicit barrier: all adds of this phase are complete before any read */
++        #pragma omp parallel reduction(+:sink)
++        { for (int k = 0; k < nl; ++k) sink += __atomic_load_n(&ctr[k].v, __ATOMIC_RELAXED); }
++    }
++    bench_roi_end();
++    int ok = 1;
++    for (int k = 0; k < nl; ++k) ok &= ctr[k].v == th * it * ph;
++    /* read phase p (1-based) sees th*it*p in each of nl lines, read by th threads */
++    long long expect = (long long)th * th * it * nl * ph * (ph + 1) / 2;
++    ok &= sink == expect;
++    printf("per-cell oracle: %s (%d cells, %d phases) read_sink=%lld expected=%lld\n",
++           ok ? "CORRECT" : "WRONG", nl, ph, sink, expect);
++    return ok ? 0 : 2;
++}
 diff --git a/bench/scatter_rw.c b/bench/scatter_rw.c
 new file mode 100644
 index 0000000..b49bbc2
@@ -1529,10 +1578,10 @@ index 0000000..1ec40df
 +print("Exiting @ tick", m5.curTick(), "because", exit_event.getCause())
 diff --git a/configs/ruby/MOESI_D.py b/configs/ruby/MOESI_D.py
 new file mode 100644
-index 0000000..e8ebf2f
+index 0000000..ec8e695
 --- /dev/null
 +++ b/configs/ruby/MOESI_D.py
-@@ -0,0 +1,356 @@
+@@ -0,0 +1,362 @@
 +# Copyright (c) 2019 ARM Limited
 +# All rights reserved.
 +#
@@ -1641,6 +1690,10 @@ index 0000000..e8ebf2f
 +    # 0 selects "equal to the service latency", i.e. no pipelining.
 +    init_interval = bounded_env("DSTATE_INIT_INTERVAL", "0", 0, 65535) or exec_latency
 +    busy_stall = flag_env("DSTATE_BUSY_STALL", "0")
++    # Back-pressure instead of NACK when the bank executor is full.
++    queue_stall = flag_env("DSTATE_QUEUE_STALL", "0")
++    # Requester-side combining: queued same-word adds per issued request (1 = off).
++    req_combine = bounded_env("DSTATE_REQ_COMBINE", "1", 1, 64)
 +    # Service-model and combining knobs (all default to the shipped behaviour).
 +    # 0 hit latency selects "equal to the service latency" (no hot-word benefit).
 +    hit_latency = bounded_env("DSTATE_HIT_LATENCY", "0", 0, 65535) or exec_latency
@@ -1707,6 +1760,7 @@ index 0000000..e8ebf2f
 +        )
 +
 +        cpu_seq = RubySequencer(
++            dstate_request_combine=req_combine,
 +            version=i,
 +            dcache=l1d_cache,
 +            clk_domain=clk_domain,
@@ -1777,6 +1831,7 @@ index 0000000..e8ebf2f
 +            d_state_queue_depth=queue_depth,
 +            d_state_init_interval=init_interval,
 +            d_state_busy_stall=busy_stall,
++            d_state_queue_stall=queue_stall,
 +            d_state_hit_latency=hit_latency,
 +            d_state_hotwords=hotwords,
 +            d_state_merge_limit=merge_limit,
@@ -4012,10 +4067,10 @@ index 0000000..361ce99
 +}
 diff --git a/src/mem/ruby/protocol/MOESI_D-L2cache.sm b/src/mem/ruby/protocol/MOESI_D-L2cache.sm
 new file mode 100644
-index 0000000..652fbeb
+index 0000000..1c7c06a
 --- /dev/null
 +++ b/src/mem/ruby/protocol/MOESI_D-L2cache.sm
-@@ -0,0 +1,3472 @@
+@@ -0,0 +1,3494 @@
 +/*
 + * Copyright (c) 2019 ARM Limited
 + * All rights reserved
@@ -4077,6 +4132,10 @@ index 0000000..652fbeb
 +  int d_state_queue_depth := 1;
 +  Cycles d_state_init_interval := 42;
 +  bool d_state_busy_stall := "False";
++  // Back-pressure: when the executor is at capacity, park the request in the
++  // finite input buffer and wake it when a slot is released, instead of NACKing
++  // it into a full ownership migration. Default off (reject, as shipped).
++  bool d_state_queue_stall := "False";
 +  //   hit_latency   service time when the target word is in the bank's hot-word
 +  //                 buffer (registers, not the SRAM array); default = full latency
 +  //   hotwords      hot-word buffer entries per bank; 0 disables the model
@@ -4205,6 +4264,7 @@ index 0000000..652fbeb
 +  enumeration(Event, desc="Cache events") {
 +    DState_Reject, desc="Pre-acceptance rejection: no mutation or future execution";
 +    DState_Busy, desc="Line is acquiring or executing another update; wait, do not reject";
++    DState_Full, desc="Executor at capacity; wait for a released slot instead of rejecting";
 +    DState_Merge, desc="Same-word update folded into the pending accepted operation";
 +    DState_CompleteMerged, desc="Service time elapsed for an operation with merged requesters";
 +    DState_AckMore, desc="Acknowledge the next merged requester";
@@ -4325,6 +4385,7 @@ index 0000000..652fbeb
 +  void unset_tbe();
 +  MachineID mapAddressToMachine(Addr addr, MachineType mtype);
 +  void wakeUpAllBuffers(Addr a);
++  void wakeUpAllBuffers();
 +
 +  // Latency for responses that fetch data from cache
 +  Cycles cacheResponseLatency() {
@@ -4918,6 +4979,9 @@ index 0000000..652fbeb
 +            trigger(Event:DState_Merge, in_msg.addr, ce, TBEs[in_msg.addr]);
 +          } else if (busy && d_state_busy_stall) {
 +            trigger(Event:DState_Busy, in_msg.addr, ce, TBEs[in_msg.addr]);
++          } else if (owner_ok && d_state_queue_stall &&
++                     dStateEngine.hasCapacity(d_state_queue_depth) == false) {
++            trigger(Event:DState_Full, in_msg.addr, ce, TBEs[in_msg.addr]);
 +          } else if (owner_ok == false ||
 +              dStateEngine.hasCapacity(d_state_queue_depth) == false ||
 +              TBEs.areNSlotsAvailable(1, clockEdge()) == false) {
@@ -5907,12 +5971,20 @@ index 0000000..652fbeb
 +  action(d_finish, "dfinish", desc="Release the executor after the ACK was queued") {
 +    dStateTimer.unset(address);
 +    dStateEngine.release();
++    if (d_state_queue_stall) {
++      // A slot is free: re-analyse requests parked by DState_Full (any line).
++      wakeUpAllBuffers();
++    }
 +  }
 +  action(d_unsetTimer, "dtimeroff", desc="Service complete; the merged-requester ACKs follow via the trigger queue") {
 +    dStateTimer.unset(address);
 +  }
 +  action(d_releaseEngine, "drelease", desc="Release the executor after the last merged ACK was queued") {
 +    dStateEngine.release();
++    if (d_state_queue_stall) {
++      // A slot is free: re-analyse requests parked by DState_Full (any line).
++      wakeUpAllBuffers();
++    }
 +  }
 +  action(d_ackNextMerged, "dackm", desc="Acknowledge one merged requester with its own transaction ID") {
 +    assert(is_valid(tbe));
@@ -7319,6 +7391,11 @@ index 0000000..652fbeb
 +              ILOD, ILOSD, ILOSW, ILOSXD, ILOSXW, ILOW, ILOXD, ILOXW, ILSI, ILSW, ILXD, ILXW,
 +              ISFGS, IW, MI, MII, MM, OGMIO, OGMIOF, OI, OLSF, OLSI, OLSS, OLSW, OLSXS, OLSXW,
 +              OO, OW, OXW, SLSS, SLSW, SS, SW}, DState_Busy) {
++    st_stallAndWaitL1RequestQueue;
++  }
++
++  // Executor full in an accepting state: wait for a released slot.
++  transition({I, M, D, ILX, ILOX, OLSX}, DState_Full) {
 +    st_stallAndWaitL1RequestQueue;
 +  }
 +
@@ -9375,7 +9452,7 @@ index 0000000..f5c0388
 +} // namespace gem5::ruby
 +#endif
 diff --git a/src/mem/ruby/system/Sequencer.cc b/src/mem/ruby/system/Sequencer.cc
-index ec9b417..4767795 100644
+index ec9b417..dacbae9 100644
 --- a/src/mem/ruby/system/Sequencer.cc
 +++ b/src/mem/ruby/system/Sequencer.cc
 @@ -42,6 +42,7 @@
@@ -9386,7 +9463,53 @@ index ec9b417..4767795 100644
  #include "cpu/testers/rubytest/RubyTester.hh"
  #include "debug/LLSC.hh"
  #include "debug/ProtocolTrace.hh"
-@@ -695,6 +696,36 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
+@@ -72,6 +73,7 @@ Sequencer::Sequencer(const Params &p)
+ 
+     m_dataCache_ptr = p.dcache;
+     m_max_outstanding_requests = p.max_outstanding_requests;
++    m_dstateRequestCombine = p.dstate_request_combine;
+     m_deadlock_threshold = p.deadlock_threshold;
+ 
+     m_coreId = p.coreid; // for tracking the two CorePair sequencers
+@@ -494,7 +496,7 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
+             // Do not process follow-up requests
+             // (e.g. if full line no present)
+             // Reissue to the cache hierarchy
+-            issueRequest(seq_req.pkt, seq_req.m_second_type);
++            issueFront(address, seq_req_list);
+             break;
+         }
+ 
+@@ -587,7 +589,8 @@ Sequencer::processReadCallback(SequencerRequest &seq_req,
+         (seq_req.m_type != RubyRequestType_IFETCH) &&
+         (seq_req.m_type != RubyRequestType_REPLACEMENT)) {
+         // Write request: reissue request to the cache hierarchy
+-        issueRequest(seq_req.pkt, seq_req.m_second_type);
++        const Addr line = makeLineAddress(seq_req.pkt->getAddr());
++        issueFront(line, m_RequestTable[line]);
+         return true;
+     }
+     return false;
+@@ -655,6 +658,9 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
+     assert(address == makeLineAddress(address));
+     assert(m_RequestTable.find(address) != m_RequestTable.end());
+     auto &seq_req_list = m_RequestTable[address];
++    // Applied locally: only the front request's own functor is executed below,
++    // so a combined operand sent with it is void and the others are re-issued.
++    m_dstateCombined.erase(address);
+ 
+     // Perform hitCallback only on the first cpu request that
+     // issued the ruby request
+@@ -674,7 +680,7 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
+             // Read, Write or Atomic request:
+             // reissue request to the cache hierarchy
+             // (we don't know if op was performed remotly)
+-            issueRequest(seq_req.pkt, seq_req.m_second_type);
++            issueFront(address, seq_req_list);
+             break;
+         }
+ 
+@@ -695,6 +701,104 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
      }
  }
  
@@ -9399,31 +9522,99 @@ index ec9b417..4767795 100644
 +    panic_if(it == m_RequestTable.end() || it->second.empty(),
 +             "Delegated atomic completed without an outstanding request");
 +    auto &requests = it->second;
-+    auto &request = requests.front();
-+    panic_if(request.m_type != RubyRequestType_ATOMIC_NO_RETURN,
-+             "Remote completion is only valid for a no-return atomic");
 +    panic_if(m_usingRubyTester || m_ruby_system->getWarmupEnabled() ||
 +             m_ruby_system->getCooldownEnabled(),
 +             "MOESI-D remote completion requires the supported timing-CPU mode");
-+    PacketPtr pkt = request.pkt;
-+    recordMissLatency(&request, true, MachineType_NUM, true,
-+                      Cycles(0), Cycles(0), Cycles(0));
++    // One ACK completes every CPU request that the outstanding (possibly
++    // combined, see issueFront) request carried: the home applied their sum.
++    int count = 1;
++    auto cit = m_dstateCombined.find(address);
++    if (cit != m_dstateCombined.end()) {
++        count = cit->second;
++        m_dstateCombined.erase(cit);
++    }
++    panic_if(count < 1 || count > int(requests.size()),
++             "Combined no-return atomic covers more requests than are queued");
++    std::vector<PacketPtr> completed;
++    for (int i = 0; i < count; ++i) {
++        auto &request = requests.front();
++        panic_if(request.m_type != RubyRequestType_ATOMIC_NO_RETURN,
++                 "Remote completion is only valid for a no-return atomic");
++        recordMissLatency(&request, true, MachineType_NUM, true,
++                          Cycles(0), Cycles(0), Cycles(0));
++        markRemoved();
++        completed.push_back(request.pkt);
++        requests.pop_front();
++    }
 +    llscClearMonitor(address);
-+    markRemoved();
-+    requests.pop_front();
 +    if (requests.empty()) {
 +        m_RequestTable.erase(it);
 +    } else {
-+        issueRequest(requests.front().pkt, requests.front().m_second_type);
++        issueFront(address, requests);
 +    }
-+    ruby_hit_callback(pkt);
++    for (PacketPtr pkt : completed) {
++        ruby_hit_callback(pkt);
++    }
 +    testDrainComplete();
++}
++
++void
++Sequencer::issueFront(Addr line, std::list<SequencerRequest> &requests)
++{
++    // MOESI-D requester-side combining. A CPU that may keep several no-return
++    // adds in flight (relaxed ordering, or an in-order store buffer) queues
++    // them here behind the one outstanding request to their line. When that
++    // request completes, the consecutive same-word adds at the front of the
++    // list are issued as ONE request whose operand is their modular sum; all
++    // of them complete on its ACK (atomicRemoteCallback). Only a consecutive
++    // run of the same type, address and width is combined, so ordering with
++    // respect to every other queued request is unchanged, and the request is
++    // still a single operand of the original width. If the L1 applies the
++    // request locally instead, atomicCallback applies the front request's own
++    // functor and re-issues the rest, so nothing is applied twice or lost.
++    assert(!requests.empty());
++    SequencerRequest &front = requests.front();
++    m_dstateCombined.erase(line);
++    if (m_dstateRequestCombine <= 1 ||
++        front.m_type != RubyRequestType_ATOMIC_NO_RETURN ||
++        !front.pkt->isAtomicOp()) {
++        issueRequest(front.pkt, front.m_second_type);
++        return;
++    }
++    const Addr addr = front.pkt->getAddr();
++    const int size = front.pkt->getSize();
++    uint64_t sum = 0;
++    int count = 0;
++    for (auto it = requests.begin();
++         it != requests.end() && count < m_dstateRequestCombine; ++it) {
++        if (it->m_type != RubyRequestType_ATOMIC_NO_RETURN ||
++            !it->pkt->isAtomicOp() || it->pkt->getAddr() != addr ||
++            it->pkt->getSize() != size) {
++            break;
++        }
++        auto *add32 = dynamic_cast<AtomicOpAdd<uint32_t> *>(it->pkt->getAtomicOp());
++        auto *add64 = dynamic_cast<AtomicOpAdd<uint64_t> *>(it->pkt->getAtomicOp());
++        if (!((size == 4 && add32) || (size == 8 && add64))) {
++            break;
++        }
++        sum += size == 4 ? uint64_t(add32->a) : add64->a;
++        ++count;
++    }
++    if (count <= 1) {
++        issueRequest(front.pkt, front.m_second_type);
++        return;
++    }
++    if (size == 4) {
++        sum &= 0xffffffffULL;
++    }
++    m_dstateCombined[line] = count;
++    issueRequest(front.pkt, front.m_second_type, true, sum);
 +}
 +
  void
  Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
                         bool llscSuccess,
-@@ -1009,7 +1040,7 @@ Sequencer::makeRequest(PacketPtr pkt)
+@@ -1009,7 +1113,7 @@ Sequencer::makeRequest(PacketPtr pkt)
      } else if (pkt->req->isTlbiCmd()) {
          primary_type = secondary_type = tlbiCmdToRubyRequestType(pkt);
          DPRINTF(RubySequencer, "Issuing TLBI\n");
@@ -9432,7 +9623,17 @@ index ec9b417..4767795 100644
      } else if (pkt->isAtomicOp()) {
          if (pkt->req->isAtomicReturn()){
              DPRINTF(RubySequencer, "Issuing ATOMIC RETURN \n");
-@@ -1152,6 +1183,24 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
+@@ -1087,7 +1191,8 @@ Sequencer::makeRequest(PacketPtr pkt)
+ }
+ 
+ void
+-Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
++Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type,
++                        bool combined, uint64_t combinedOperand)
+ {
+     assert(pkt != NULL);
+     ContextID proc_id = pkt->req->hasContextId() ?
+@@ -1152,6 +1257,25 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
                                  (offset, pkt->getAtomicOp()));
  
              msg->setWriteMask(offset, pkt->getSize(), atomicOps);
@@ -9447,7 +9648,8 @@ index ec9b417..4767795 100644
 +                panic_if(!((size == 4 && add32) || (size == 8 && add64)) ||
 +                         offset % size || offset + size > blk_size,
 +                         "MOESI-D supports only aligned ADD32/ADD64 timing requests");
-+                uint64_t operand = size == 4 ? uint64_t(add32->a) : add64->a;
++                uint64_t operand = combined ? combinedOperand
++                                   : (size == 4 ? uint64_t(add32->a) : add64->a);
 +                uint8_t encoded[8] = {};
 +                for (int byte = 0; byte < size; ++byte)
 +                    encoded[byte] = uint8_t(operand >> (8 * byte));
@@ -9458,7 +9660,7 @@ index ec9b417..4767795 100644
  
          DPRINTFR(ProtocolTrace, "%15s %3s %10s%20s %6s>%-6s %#x %s\n",
 diff --git a/src/mem/ruby/system/Sequencer.hh b/src/mem/ruby/system/Sequencer.hh
-index f530eb4..f2375bb 100644
+index f530eb4..ae76724 100644
 --- a/src/mem/ruby/system/Sequencer.hh
 +++ b/src/mem/ruby/system/Sequencer.hh
 @@ -125,6 +125,8 @@ class Sequencer : public RubyPort
@@ -9470,3 +9672,44 @@ index f530eb4..f2375bb 100644
      void atomicCallback(Addr address,
                          DataBlock& data,
                          const bool externalHit = false,
+@@ -210,7 +212,11 @@ class Sequencer : public RubyPort
+     { return m_IncompleteTimes[t]; }
+ 
+   protected:
+-    void issueRequest(PacketPtr pkt, RubyRequestType type);
++    void issueRequest(PacketPtr pkt, RubyRequestType type,
++                      bool combined = false, uint64_t combinedOperand = 0);
++    // Issue the request at the front of a line's list, combining a consecutive
++    // run of same-word no-return adds into one request (MOESI-D).
++    void issueFront(Addr line, std::list<SequencerRequest> &requests);
+     virtual void hitCallback(SequencerRequest* srequest, DataBlock& data,
+                              bool llscSuccess,
+                              const MachineType mach, const bool externalHit,
+@@ -242,6 +248,11 @@ class Sequencer : public RubyPort
+   protected:
+     // RequestTable contains both read and write requests, handles aliasing
+     std::unordered_map<Addr, std::list<SequencerRequest>> m_RequestTable;
++    // MOESI-D requester-side combining (see issueFront): the maximum number of
++    // queued same-word no-return adds issued as one request, and per line the
++    // number of CPU requests covered by the outstanding combined request.
++    int m_dstateRequestCombine = 1;
++    std::unordered_map<Addr, int> m_dstateCombined;
+     // UnadressedRequestTable contains "unaddressed" requests,
+     // guaranteed not to alias each other
+     std::unordered_map<uint64_t, SequencerRequest> m_UnaddressedRequestTable;
+diff --git a/src/mem/ruby/system/Sequencer.py b/src/mem/ruby/system/Sequencer.py
+index 49c6374..7f912c8 100644
+--- a/src/mem/ruby/system/Sequencer.py
++++ b/src/mem/ruby/system/Sequencer.py
+@@ -96,6 +96,11 @@ class RubySequencer(RubyPort):
+     max_outstanding_requests = Param.Int(
+         16, "max requests (incl. prefetches) outstanding"
+     )
++    # MOESI-D: queued same-word no-return adds issued as one summed request
++    # when the previous request to that line completes. 1 disables combining.
++    dstate_request_combine = Param.Int(
++        1, "max no-return adds to one word combined into one request"
++    )
+     deadlock_threshold = Param.Cycles(
+         500000,
+         "max outstanding cycles for a request "

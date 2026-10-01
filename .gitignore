@@ -5,6 +5,7 @@ bench/scatter_nm
 bench/scatter_base_nm
 bench/scatter_multi
 bench/scatter_multi_base
+bench/scatter_phased
 bench/scatter_rw
 bench/scatter_rw_base
 bench/spmv_dstate
