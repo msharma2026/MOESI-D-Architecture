@@ -23,6 +23,8 @@ RUBY = [
     "src/mem/ruby/SConscript",
     "src/mem/ruby/common/DataBlock.hh",
     "src/mem/ruby/network/Network.cc",
+    "src/mem/ruby/network/garnet/GarnetNetwork.cc",
+    "src/mem/ruby/network/garnet/GarnetNetwork.hh",
     "src/mem/ruby/protocol/Kconfig",
     "src/mem/ruby/protocol/RubySlicc_Exports.sm",
     "src/mem/ruby/protocol/RubySlicc_Types.sm",

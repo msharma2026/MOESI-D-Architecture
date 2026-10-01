@@ -106,6 +106,15 @@ Round-three mechanisms, layered on the round-two columns (`ablate.sh v3`):
 | requester combining | `DSTATE_REQ_COMBINE=16` | queued same-word adds from one core issued as one summed request; only reachable when the core keeps several adds in flight |
 | deeper executor | `DSTATE_QUEUE_DEPTH=16 DSTATE_MERGE_LIMIT=64` | sensitivity points for the two queues |
 
+Round-four mechanisms (`ablate.sh v4`), layered on the round-three columns:
+
+| Column | Adds | Models |
+|---|---|---|
+| far reads | `DSTATE_FAR_READS=1 DSTATE_READ_DOWNGRADE=64` | a load of a retained line gets a snapshot, no sharer; read-heavy lines fall back to cached copies after 64 reads without an update |
+| delta line | `DSTATE_DELTA_MIN_WORDS=2` | a core's queued adds to several words of one line go as one masked request (32/48/80/144 B by word count) |
+| oracle | `DSTATE_RANGE_LO_MB=512 DSTATE_RANGE_HI_MB=768` on `scatter_mixed` | each region given its best static treatment; bounds what any dynamic policy can earn |
+| request limit | `DSTATE_MAX_OUTSTANDING=32/64` | per-core outstanding-request sweep at 16 cores |
+
 `run_matrix.py --modes` selects a subset of the four modes; `ablate.sh v3 scale`
 uses `local,remote,persistent` at 8 and 16 cores, and `v3 phased` runs
 `bench/scatter_phased` (update every line, then every thread reads every line,

@@ -223,6 +223,25 @@ full ownership migration. Accepted operations complete through the timer and
 the response network, never through the request buffer, so the stall adds no
 new dependency to the liveness argument.
 
+**Far reads** (`DSTATE_FAR_READS`): a local load that reaches a line held in D
+is answered with a snapshot of the data (`DATA_UNCACHED`, charged as a full data
+response) and no sharer is recorded; the L1 completes the load from the message
+and installs nothing. The next update therefore applies with no invalidation and
+the line never leaves the home. A load from a core whose own add is still in
+flight waits at that L1 (`D_REQ` recycles loads) until the ACK, so a core always
+sees its own adds. After `read_downgrade_threshold` reads with no update in
+between, the line is judged read-heavy and the next load takes the ordinary path
+and receives a cached copy; an accepted update resets the count. **Delta-line
+requests** (`DSTATE_DELTA_MIN_WORDS`): when the Sequencer's queued run of adds
+spans several words of one line, it sends one request whose data block carries
+every word's summed delta and whose two masks name the 4- and 8-byte words
+(`IADD_LINE`, 32 to 144 bytes by word count); the home applies all masked words
+in one operation and acknowledges every requester. Bank-side merging now uses the
+same masks: any request whose words do not claim a byte at a different width can
+fold into the executing operation. **Static placement** (`DSTATE_RANGE_LO_MB`,
+`DSTATE_RANGE_HI_MB`) delegates only adds to one virtual-address range, decided
+in the Sequencer (Ruby sees physical addresses), for oracle experiments.
+
 Separate virtual networks and priority for completion/responses help preserve
 progress but do **not** prove deadlock freedom with finite queues. Required
 remaining work includes dependency graphs, adversarial interleavings and

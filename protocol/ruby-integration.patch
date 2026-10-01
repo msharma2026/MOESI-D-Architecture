@@ -161,7 +161,7 @@ index ea97d72..698427a 100644
  MakeInclude('structures/TimerTable.hh')
  MakeInclude('structures/WireBuffer.hh')
 diff --git a/src/mem/ruby/common/DataBlock.hh b/src/mem/ruby/common/DataBlock.hh
-index ebfa7d1..7d7a5b5 100644
+index ebfa7d1..d842103 100644
 --- a/src/mem/ruby/common/DataBlock.hh
 +++ b/src/mem/ruby/common/DataBlock.hh
 @@ -49,6 +49,7 @@
@@ -172,15 +172,18 @@ index ebfa7d1..7d7a5b5 100644
  
  namespace gem5
  {
-@@ -98,6 +99,7 @@ class DataBlock
+@@ -98,6 +99,10 @@ class DataBlock
      void clearAtomicLogEntries();
      uint8_t *getDataMod(int offset);
      void setByte(int whichByte, uint8_t data);
 +    void applyDStateAdd(const DataBlock &operand, int offset, int size);
++    // Every word named by the masks (bit i of mask32: 4-byte slot 4i; bit k of
++    // mask64: 8-byte slot 8k) += the same word of `operand`, modular.
++    void applyDStateAddMasked(const DataBlock &operand, int mask32, int mask64);
      void setData(const uint8_t *data, int offset, int len);
      void setData(PacketPtr pkt);
      void copyPartial(const DataBlock &dblk, int offset, int len);
-@@ -147,6 +149,17 @@ DataBlock::setByte(int whichByte, uint8_t data)
+@@ -147,6 +152,26 @@ DataBlock::setByte(int whichByte, uint8_t data)
      m_data[whichByte] = data;
  }
  
@@ -195,14 +198,23 @@ index ebfa7d1..7d7a5b5 100644
 +    dstateAdd(m_data, operand.m_data, m_block_size, offset, size);
 +}
 +
++inline void
++DataBlock::applyDStateAddMasked(const DataBlock &operand, int mask32, int mask64)
++{
++    assert(m_alloc && operand.m_alloc);
++    assert(m_block_size >= 128 && operand.m_block_size == m_block_size);
++    dstateAddMasked(m_data, operand.m_data, m_block_size,
++                    std::uint32_t(mask32), std::uint32_t(mask64));
++}
++
  inline void
  DataBlock::copyPartial(const DataBlock & dblk, int offset, int len)
  {
 diff --git a/src/mem/ruby/network/Network.cc b/src/mem/ruby/network/Network.cc
-index 480b5bc..1976d9c 100644
+index 480b5bc..811a774 100644
 --- a/src/mem/ruby/network/Network.cc
 +++ b/src/mem/ruby/network/Network.cc
-@@ -166,6 +166,12 @@ uint32_t
+@@ -166,6 +166,20 @@ uint32_t
  Network::MessageSizeType_to_int(MessageSizeType size_type)
  {
      switch(size_type) {
@@ -210,11 +222,53 @@ index 480b5bc..1976d9c 100644
 +        return 16;
 +      case MessageSizeType_DState_Update64:
 +        return 24;
++      case MessageSizeType_DState_UpdateW4:
++        return 32;
++      case MessageSizeType_DState_UpdateW8:
++        return 48;
++      case MessageSizeType_DState_UpdateW16:
++        return 80;
++      case MessageSizeType_DState_UpdateW32:
++        return 144;
 +      case MessageSizeType_DState_Response:
 +        return 8;
        case MessageSizeType_Control:
        case MessageSizeType_Request_Control:
        case MessageSizeType_Reissue_Control:
+diff --git a/src/mem/ruby/network/garnet/GarnetNetwork.cc b/src/mem/ruby/network/garnet/GarnetNetwork.cc
+index 5792269..74c493d 100644
+--- a/src/mem/ruby/network/garnet/GarnetNetwork.cc
++++ b/src/mem/ruby/network/garnet/GarnetNetwork.cc
+@@ -615,6 +615,13 @@ GarnetNetwork::update_traffic_distribution(RouteInfo route)
+         (*m_ctrl_traffic_distribution[src_node][dest_node])++;
+ }
+ 
++bool
++GarnetNetwork::functionalRead(Packet *pkt)
++{
++    WriteMask mask(getRubySystem()->getBlockSizeBytes());
++    return functionalRead(pkt, mask);
++}
++
+ bool
+ GarnetNetwork::functionalRead(Packet *pkt, WriteMask &mask)
+ {
+diff --git a/src/mem/ruby/network/garnet/GarnetNetwork.hh b/src/mem/ruby/network/garnet/GarnetNetwork.hh
+index db37628..18dcf55 100644
+--- a/src/mem/ruby/network/garnet/GarnetNetwork.hh
++++ b/src/mem/ruby/network/garnet/GarnetNetwork.hh
+@@ -107,6 +107,11 @@ class GarnetNetwork : public Network
+                           PortDirection dest_inport_dirn);
+ 
+     bool functionalRead(Packet *pkt, WriteMask &mask);
++    // RubySystem::functionalRead falls back to the unmasked form when no
++    // controller holds a readable copy (a store in flight); upstream Garnet
++    // leaves it at the base class fatal. Same semantics as SimpleNetwork's:
++    // true when a copy in transit was read into the packet.
++    bool functionalRead(Packet *pkt) override;
+     //! Function for performing a functional write. The return value
+     //! indicates the number of messages that were written.
+     uint32_t functionalWrite(Packet *pkt);
 diff --git a/src/mem/ruby/protocol/Kconfig b/src/mem/ruby/protocol/Kconfig
 index 5b584fb..b53aa87 100644
 --- a/src/mem/ruby/protocol/Kconfig
@@ -231,10 +285,10 @@ index 5b584fb..b53aa87 100644
      bool "MOESI CMP directory"
      default n
 diff --git a/src/mem/ruby/protocol/RubySlicc_Exports.sm b/src/mem/ruby/protocol/RubySlicc_Exports.sm
-index 33c1b55..d3f9dea 100644
+index 33c1b55..ead4e24 100644
 --- a/src/mem/ruby/protocol/RubySlicc_Exports.sm
 +++ b/src/mem/ruby/protocol/RubySlicc_Exports.sm
-@@ -78,11 +78,13 @@ structure(WriteMask, external="yes", desc="...") {
+@@ -78,11 +78,14 @@ structure(WriteMask, external="yes", desc="...") {
  }
  
  structure(DataBlock, external = "yes", desc="..."){
@@ -245,10 +299,11 @@ index 33c1b55..d3f9dea 100644
    void atomicPartial(DataBlock, WriteMask);
    void atomicPartial(DataBlock, WriteMask, bool);
 +  void applyDStateAdd(DataBlock, int, int);
++  void applyDStateAddMasked(DataBlock, int, int);
    int numAtomicLogEntries();
    void clearAtomicLogEntries();
  }
-@@ -290,6 +292,14 @@ enumeration(MachineType, desc="...", default="MachineType_NULL") {
+@@ -290,6 +293,20 @@ enumeration(MachineType, desc="...", default="MachineType_NULL") {
  
  // MessageSizeType
  enumeration(MessageSizeType, desc="...") {
@@ -259,12 +314,18 @@ index 33c1b55..d3f9dea 100644
 +  //   the requester keys on the tag, so no address travels back.
 +  DState_Update, desc="16-byte 32-bit update: 63-bit header + 32-bit operand";
 +  DState_Update64, desc="24-byte 64-bit update: 63-bit header + 64-bit operand";
++  //   Delta-line updates carry several words of one line: 63-bit header + 32-bit
++  //   mask32 + 16-bit mask64 = 111b -> 14 B, plus 4 B per 32-bit word slot.
++  DState_UpdateW4,  desc="32-byte delta update: header + up to 4 word slots";
++  DState_UpdateW8,  desc="48-byte delta update: header + up to 8 word slots";
++  DState_UpdateW16, desc="80-byte delta update: header + up to 16 word slots";
++  DState_UpdateW32, desc="144-byte delta update: header + a full 128-byte delta line";
 +  DState_Response, desc="8-byte terminal ACK/NACK: tag, requester, status";
    Control,    desc="Control Message";
    Data,       desc="Data Message";
    Request_Control, desc="Request";
 diff --git a/src/mem/ruby/protocol/RubySlicc_Types.sm b/src/mem/ruby/protocol/RubySlicc_Types.sm
-index 848d164..b19589a 100644
+index 848d164..b36a976 100644
 --- a/src/mem/ruby/protocol/RubySlicc_Types.sm
 +++ b/src/mem/ruby/protocol/RubySlicc_Types.sm
 @@ -139,6 +139,7 @@ structure (Sequencer, external = "yes") {
@@ -275,12 +336,23 @@ index 848d164..b19589a 100644
    void atomicCallback(Addr, DataBlock);
    void atomicCallback(Addr, DataBlock, bool);
    void atomicCallback(Addr, DataBlock, bool, MachineType);
+@@ -180,6 +181,10 @@ structure(RubyRequest, desc="...", interface="Message", external="yes") {
+   int contextId,             desc="this goes away but must be replace with Nilay";
+   WriteMask writeMask,       desc="Writethrough mask";
+   DataBlock WTData,          desc="Writethrough data block";
++  int DStateMask32,          desc="MOESI-D: 4-byte words of WTData that carry an add (bit i -> offset 4i)";
++  int DStateMask64,          desc="MOESI-D: 8-byte words of WTData that carry an add (bit k -> offset 8k)";
++  int DStateWords,           desc="MOESI-D: distinct words combined into this request (1 = scalar)";
++  bool DStateLocalOnly,      desc="MOESI-D: static placement says this add takes the local path";
+   int wfid,                  desc="Writethrough wavefront";
+   uint64_t instSeqNum,       desc="Instruction sequence number";
+   PacketPtr pkt,             desc="Packet associated with this request";
 diff --git a/src/mem/ruby/structures/DStateEngine.hh b/src/mem/ruby/structures/DStateEngine.hh
 new file mode 100644
-index 0000000..dd1f84a
+index 0000000..bd3fb48
 --- /dev/null
 +++ b/src/mem/ruby/structures/DStateEngine.hh
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,148 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Finite-capacity bank executor reference model, not a synthesized datapath.
 +// Capacity, initiation interval, service latencies and the hot-word buffer are
@@ -318,9 +390,46 @@ index 0000000..dd1f84a
 +        data[offset + byte] = std::uint8_t(value >> (8 * byte));
 +}
 +
++// Word masks for multi-word (delta-line) operations: bit i of mask32 marks the
++// 4-byte slot at offset 4i, bit k of mask64 the 8-byte slot at offset 8k. A
++// request is well formed when no byte is claimed at both widths.
++inline std::uint32_t dstateMask64As32(std::uint32_t m64)
++{
++    std::uint32_t out = 0;
++    for (int k = 0; k < 16; ++k)
++        if ((m64 >> k) & 1u) out |= 3u << (2 * k);
++    return out;
++}
++inline bool dstateMasksDisjoint(std::uint32_t a32, std::uint32_t a64,
++                                std::uint32_t b32, std::uint32_t b64)
++{
++    return (a32 & dstateMask64As32(b64)) == 0 && (b32 & dstateMask64As32(a64)) == 0;
++}
++inline void dstateAddMasked(std::uint8_t *data, const std::uint8_t *operand,
++                            int blockSize, std::uint32_t m32, std::uint32_t m64)
++{
++    for (int i = 0; i < 32; ++i)
++        if ((m32 >> i) & 1u) dstateAdd(data, operand, blockSize, 4 * i, 4);
++    for (int k = 0; k < 16; ++k)
++        if ((m64 >> k) & 1u) dstateAdd(data, operand, blockSize, 8 * k, 8);
++}
++
 +class DStateEngine
 +{
 +  public:
++    // One request's own masks must not claim a byte at both widths.
++    bool masksValid(int m32, int m64) const
++    {
++        return dstateMasksDisjoint(std::uint32_t(m32), 0, 0, std::uint32_t(m64)) &&
++               (m32 != 0 || m64 != 0);
++    }
++    void hotWordTouchMask(std::uint64_t line, int m32, int m64, int capacity)
++    {
++        for (int i = 0; i < 32; ++i)
++            if ((std::uint32_t(m32) >> i) & 1u) hotWordTouch(line, 4 * i, capacity);
++        for (int k = 0; k < 16; ++k)
++            if ((std::uint32_t(m64) >> k) & 1u) hotWordTouch(line, 8 * k, capacity);
++    }
 +    // Admission: at most `capacity` accepted operations in flight per bank.
 +    bool hasCapacity(int capacity) const { return inflight < capacity; }
 +    int occupancy() const { return inflight; }
@@ -394,10 +503,10 @@ index 0000000..dd1f84a
 +#endif
 diff --git a/src/mem/ruby/structures/DStateMergeSet.hh b/src/mem/ruby/structures/DStateMergeSet.hh
 new file mode 100644
-index 0000000..f5c0388
+index 0000000..5a1b144
 --- /dev/null
 +++ b/src/mem/ruby/structures/DStateMergeSet.hh
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,61 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Requesters whose same-word update was folded into an already-accepted
 +// operation (combining). Each still receives exactly one terminal ACK carrying
@@ -415,6 +524,7 @@ index 0000000..f5c0388
 +#include <vector>
 +
 +#include "mem/ruby/common/MachineID.hh"
++#include "mem/ruby/structures/DStateEngine.hh"
 +
 +namespace gem5::ruby
 +{
@@ -426,11 +536,30 @@ index 0000000..f5c0388
 +    MachineID requester(int i) const { assert(i >= 0 && i < count()); return entries[i].first; }
 +    std::uint64_t id(int i) const { assert(i >= 0 && i < count()); return entries[i].second; }
 +    void popBack() { assert(!entries.empty()); entries.pop_back(); }
-+    void clear() { entries.clear(); }
-+    void print(std::ostream &out) const { out << "DStateMergeSet(n=" << entries.size() << ")"; }
++    void clear() { entries.clear(); m32 = 0; m64 = 0; }
++    void print(std::ostream &out) const
++    { out << "DStateMergeSet(n=" << entries.size() << " m32=" << m32 << " m64=" << m64 << ")"; }
++
++    // Words the accepted operation touches (OR of every merged request). A
++    // scalar request that carries no masks is described by its offset/width.
++    void setMasks(int mask32, int mask64, int offset, int size)
++    {
++        m32 = std::uint32_t(mask32); m64 = std::uint32_t(mask64);
++        if (m32 == 0 && m64 == 0) {
++            if (size == 8) m64 = 1u << (offset / 8); else m32 = 1u << (offset / 4);
++        }
++    }
++    // Another request can fold into this operation when no byte is claimed at
++    // two different widths; same-word adds (same width) always qualify.
++    bool masksCompatible(int mask32, int mask64) const
++    { return dstateMasksDisjoint(m32, m64, std::uint32_t(mask32), std::uint32_t(mask64)); }
++    void orMasks(int mask32, int mask64) { m32 |= std::uint32_t(mask32); m64 |= std::uint32_t(mask64); }
++    int mask32() const { return int(m32); }
++    int mask64() const { return int(m64); }
 +
 +  private:
 +    std::vector<std::pair<MachineID, std::uint64_t>> entries;
++    std::uint32_t m32 = 0, m64 = 0;
 +};
 +inline std::ostream &operator<<(std::ostream &out, const DStateMergeSet &set)
 +{
@@ -440,26 +569,31 @@ index 0000000..f5c0388
 +} // namespace gem5::ruby
 +#endif
 diff --git a/src/mem/ruby/system/Sequencer.cc b/src/mem/ruby/system/Sequencer.cc
-index ec9b417..dacbae9 100644
+index ec9b417..8b156e3 100644
 --- a/src/mem/ruby/system/Sequencer.cc
 +++ b/src/mem/ruby/system/Sequencer.cc
-@@ -42,6 +42,7 @@
+@@ -42,6 +42,9 @@
  #include "mem/ruby/system/Sequencer.hh"
  
  #include "base/logging.hh"
++#include <map>
++
 +#include "base/amo.hh"
  #include "cpu/testers/rubytest/RubyTester.hh"
  #include "debug/LLSC.hh"
  #include "debug/ProtocolTrace.hh"
-@@ -72,6 +73,7 @@ Sequencer::Sequencer(const Params &p)
+@@ -72,6 +75,10 @@ Sequencer::Sequencer(const Params &p)
  
      m_dataCache_ptr = p.dcache;
      m_max_outstanding_requests = p.max_outstanding_requests;
 +    m_dstateRequestCombine = p.dstate_request_combine;
++    m_dstateDeltaMinWords = p.dstate_delta_min_words;
++    m_dstateRangeLoMb = p.dstate_range_lo_mb;
++    m_dstateRangeHiMb = p.dstate_range_hi_mb;
      m_deadlock_threshold = p.deadlock_threshold;
  
      m_coreId = p.coreid; // for tracking the two CorePair sequencers
-@@ -494,7 +496,7 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
+@@ -494,7 +501,7 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
              // Do not process follow-up requests
              // (e.g. if full line no present)
              // Reissue to the cache hierarchy
@@ -468,7 +602,7 @@ index ec9b417..dacbae9 100644
              break;
          }
  
-@@ -587,7 +589,8 @@ Sequencer::processReadCallback(SequencerRequest &seq_req,
+@@ -587,7 +594,8 @@ Sequencer::processReadCallback(SequencerRequest &seq_req,
          (seq_req.m_type != RubyRequestType_IFETCH) &&
          (seq_req.m_type != RubyRequestType_REPLACEMENT)) {
          // Write request: reissue request to the cache hierarchy
@@ -478,7 +612,7 @@ index ec9b417..dacbae9 100644
          return true;
      }
      return false;
-@@ -655,6 +658,9 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
+@@ -655,6 +663,9 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
      assert(address == makeLineAddress(address));
      assert(m_RequestTable.find(address) != m_RequestTable.end());
      auto &seq_req_list = m_RequestTable[address];
@@ -488,7 +622,7 @@ index ec9b417..dacbae9 100644
  
      // Perform hitCallback only on the first cpu request that
      // issued the ruby request
-@@ -674,7 +680,7 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
+@@ -674,7 +685,7 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
              // Read, Write or Atomic request:
              // reissue request to the cache hierarchy
              // (we don't know if op was performed remotly)
@@ -497,7 +631,7 @@ index ec9b417..dacbae9 100644
              break;
          }
  
-@@ -695,6 +701,104 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
+@@ -695,6 +706,167 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
      }
  }
  
@@ -569,40 +703,103 @@ index ec9b417..dacbae9 100644
 +        issueRequest(front.pkt, front.m_second_type);
 +        return;
 +    }
-+    const Addr addr = front.pkt->getAddr();
-+    const int size = front.pkt->getSize();
-+    uint64_t sum = 0;
-+    int count = 0;
++    // Gather the consecutive run of no-return adds to this LINE, summing per
++    // word. Two widths claiming the same bytes end the run.
++    struct Word { int size; uint64_t sum; };
++    std::map<int, Word> words;
++    const int frontOff = getOffset(front.pkt->getAddr());
++    const int frontSize = front.pkt->getSize();
++    int count = 0, frontRun = 0;
++    bool frontRunOpen = true;
 +    for (auto it = requests.begin();
 +         it != requests.end() && count < m_dstateRequestCombine; ++it) {
-+        if (it->m_type != RubyRequestType_ATOMIC_NO_RETURN ||
-+            !it->pkt->isAtomicOp() || it->pkt->getAddr() != addr ||
-+            it->pkt->getSize() != size) {
++        if (it->m_type != RubyRequestType_ATOMIC_NO_RETURN || !it->pkt->isAtomicOp()) {
 +            break;
 +        }
++        const int off = getOffset(it->pkt->getAddr());
++        const int size = it->pkt->getSize();
 +        auto *add32 = dynamic_cast<AtomicOpAdd<uint32_t> *>(it->pkt->getAtomicOp());
 +        auto *add64 = dynamic_cast<AtomicOpAdd<uint64_t> *>(it->pkt->getAtomicOp());
-+        if (!((size == 4 && add32) || (size == 8 && add64))) {
++        if (!((size == 4 && add32) || (size == 8 && add64)) || off % size) {
 +            break;
 +        }
-+        sum += size == 4 ? uint64_t(add32->a) : add64->a;
++        bool conflict = false;
++        for (const auto &w : words) {
++            if ((w.first != off || w.second.size != size) &&
++                w.first < off + size && off < w.first + w.second.size) {
++                conflict = true;
++            }
++        }
++        if (conflict) {
++            break;
++        }
++        Word &w = words[off];
++        w.size = size;
++        w.sum += size == 4 ? uint64_t(add32->a) : add64->a;
 +        ++count;
++        if (frontRunOpen && off == frontOff && size == frontSize) {
++            ++frontRun;
++        } else {
++            frontRunOpen = false;
++        }
 +    }
 +    if (count <= 1) {
 +        issueRequest(front.pkt, front.m_second_type);
 +        return;
 +    }
-+    if (size == 4) {
-+        sum &= 0xffffffffULL;
++    DStateCombinedOp op;
++    auto wordMask = [](int off, int size, DStateCombinedOp &o) {
++        if (size == 8) o.mask64 |= 1u << (off / 8); else o.mask32 |= 1u << (off / 4);
++    };
++    if (words.size() == 1) {
++        // Same word throughout: one summed operand of the original width.
++        op.operand = words.begin()->second.sum;
++        if (frontSize == 4) op.operand &= 0xffffffffULL;
++        wordMask(frontOff, frontSize, op);
++        m_dstateCombined[line] = count;
++        issueRequest(front.pkt, front.m_second_type, &op);
++        return;
 +    }
-+    m_dstateCombined[line] = count;
-+    issueRequest(front.pkt, front.m_second_type, true, sum);
++    if (m_dstateDeltaMinWords > 0 && int(words.size()) >= m_dstateDeltaMinWords) {
++        // Delta line: every touched word's sum, in place, plus the word masks.
++        const int blk = m_ruby_system->getBlockSizeBytes();
++        op.line = true;
++        op.delta.assign(blk, 0);
++        for (const auto &w : words) {
++            uint64_t v = w.second.sum;
++            if (w.second.size == 4) v &= 0xffffffffULL;
++            for (int b = 0; b < w.second.size; ++b)
++                op.delta[w.first + b] = uint8_t(v >> (8 * b));
++            wordMask(w.first, w.second.size, op);
++        }
++        op.words = int(words.size());
++        m_dstateCombined[line] = count;
++        issueRequest(front.pkt, front.m_second_type, &op);
++        return;
++    }
++    // Otherwise combine only the front word's own consecutive run.
++    if (frontRun <= 1) {
++        issueRequest(front.pkt, front.m_second_type);
++        return;
++    }
++    uint64_t sum = 0;
++    int n = 0;
++    for (auto it = requests.begin(); n < frontRun; ++it, ++n) {
++        auto *add32 = dynamic_cast<AtomicOpAdd<uint32_t> *>(it->pkt->getAtomicOp());
++        auto *add64 = dynamic_cast<AtomicOpAdd<uint64_t> *>(it->pkt->getAtomicOp());
++        sum += frontSize == 4 ? uint64_t(add32->a) : add64->a;
++    }
++    if (frontSize == 4) sum &= 0xffffffffULL;
++    op.operand = sum;
++    wordMask(frontOff, frontSize, op);
++    m_dstateCombined[line] = frontRun;
++    issueRequest(front.pkt, front.m_second_type, &op);
 +}
 +
  void
  Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
                         bool llscSuccess,
-@@ -1009,7 +1113,7 @@ Sequencer::makeRequest(PacketPtr pkt)
+@@ -1009,7 +1181,7 @@ Sequencer::makeRequest(PacketPtr pkt)
      } else if (pkt->req->isTlbiCmd()) {
          primary_type = secondary_type = tlbiCmdToRubyRequestType(pkt);
          DPRINTF(RubySequencer, "Issuing TLBI\n");
@@ -611,17 +808,17 @@ index ec9b417..dacbae9 100644
      } else if (pkt->isAtomicOp()) {
          if (pkt->req->isAtomicReturn()){
              DPRINTF(RubySequencer, "Issuing ATOMIC RETURN \n");
-@@ -1087,7 +1191,8 @@ Sequencer::makeRequest(PacketPtr pkt)
+@@ -1087,7 +1259,8 @@ Sequencer::makeRequest(PacketPtr pkt)
  }
  
  void
 -Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
 +Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type,
-+                        bool combined, uint64_t combinedOperand)
++                        const DStateCombinedOp *combined)
  {
      assert(pkt != NULL);
      ContextID proc_id = pkt->req->hasContextId() ?
-@@ -1152,6 +1257,25 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
+@@ -1152,6 +1325,44 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
                                  (offset, pkt->getAtomicOp()));
  
              msg->setWriteMask(offset, pkt->getSize(), atomicOps);
@@ -629,29 +826,65 @@ index ec9b417..dacbae9 100644
 +#if defined(PROTOCOL_MOESI_D)
 +            // Transport only a known ADD operand. Do not run an arbitrary
 +            // functor on zero: that is not a valid encoding of AND/MIN/etc.
-+            if (secondary_type == RubyRequestType_ATOMIC_NO_RETURN) {
++            if (secondary_type == RubyRequestType_ATOMIC_NO_RETURN &&
++                m_dstateRangeHiMb > m_dstateRangeLoMb && pkt->req->hasVaddr()) {
++                // Static placement (oracle runs): outside the range the L1 must
++                // take the conventional local path.
++                const Addr va = pkt->req->getVaddr();
++                const Addr lo = Addr(m_dstateRangeLoMb) << 20;
++                const Addr hi = Addr(m_dstateRangeHiMb) << 20;
++                msg->m_DStateLocalOnly = !(va >= lo && va < hi);
++            }
++            if (secondary_type == RubyRequestType_ATOMIC_NO_RETURN &&
++                combined && combined->line) {
++                // Delta line (issueFront): several words of this line at once.
++                msg->m_WTData.setData(combined->delta.data(), 0, blk_size);
++                msg->m_DStateMask32 = int(combined->mask32);
++                msg->m_DStateMask64 = int(combined->mask64);
++                msg->m_DStateWords = combined->words;
++            } else if (secondary_type == RubyRequestType_ATOMIC_NO_RETURN) {
 +                auto *add32 = dynamic_cast<AtomicOpAdd<uint32_t> *>(pkt->getAtomicOp());
 +                auto *add64 = dynamic_cast<AtomicOpAdd<uint64_t> *>(pkt->getAtomicOp());
 +                const int size = pkt->getSize();
 +                panic_if(!((size == 4 && add32) || (size == 8 && add64)) ||
 +                         offset % size || offset + size > blk_size,
 +                         "MOESI-D supports only aligned ADD32/ADD64 timing requests");
-+                uint64_t operand = combined ? combinedOperand
++                uint64_t operand = combined ? combined->operand
 +                                   : (size == 4 ? uint64_t(add32->a) : add64->a);
 +                uint8_t encoded[8] = {};
 +                for (int byte = 0; byte < size; ++byte)
 +                    encoded[byte] = uint8_t(operand >> (8 * byte));
 +                msg->m_WTData.setData(encoded, offset, size);
++                msg->m_DStateMask32 = size == 4 ? int(1u << (offset / 4)) : 0;
++                msg->m_DStateMask64 = size == 8 ? int(1u << (offset / 8)) : 0;
++                msg->m_DStateWords = 1;
 +            }
 +#endif
          }
  
          DPRINTFR(ProtocolTrace, "%15s %3s %10s%20s %6s>%-6s %#x %s\n",
 diff --git a/src/mem/ruby/system/Sequencer.hh b/src/mem/ruby/system/Sequencer.hh
-index f530eb4..ae76724 100644
+index f530eb4..04bbcaa 100644
 --- a/src/mem/ruby/system/Sequencer.hh
 +++ b/src/mem/ruby/system/Sequencer.hh
-@@ -125,6 +125,8 @@ class Sequencer : public RubyPort
+@@ -60,6 +60,16 @@ namespace gem5
+ namespace ruby
+ {
+ 
++// MOESI-D: a request combined from several queued no-return adds (issueFront).
++struct DStateCombinedOp
++{
++    bool line = false;            // multi-word delta line vs one summed word
++    uint64_t operand = 0;         // summed operand (scalar form)
++    std::vector<uint8_t> delta;   // block-sized delta (line form)
++    uint32_t mask32 = 0, mask64 = 0;
++    int words = 1;
++};
++
+ struct SequencerRequest
+ {
+     PacketPtr pkt;
+@@ -125,6 +135,8 @@ class Sequencer : public RubyPort
                        const Cycles forwardRequestTime = Cycles(0),
                        const Cycles firstResponseTime = Cycles(0));
  
@@ -660,20 +893,20 @@ index f530eb4..ae76724 100644
      void atomicCallback(Addr address,
                          DataBlock& data,
                          const bool externalHit = false,
-@@ -210,7 +212,11 @@ class Sequencer : public RubyPort
+@@ -210,7 +222,11 @@ class Sequencer : public RubyPort
      { return m_IncompleteTimes[t]; }
  
    protected:
 -    void issueRequest(PacketPtr pkt, RubyRequestType type);
 +    void issueRequest(PacketPtr pkt, RubyRequestType type,
-+                      bool combined = false, uint64_t combinedOperand = 0);
++                      const DStateCombinedOp *combined = nullptr);
 +    // Issue the request at the front of a line's list, combining a consecutive
 +    // run of same-word no-return adds into one request (MOESI-D).
 +    void issueFront(Addr line, std::list<SequencerRequest> &requests);
      virtual void hitCallback(SequencerRequest* srequest, DataBlock& data,
                               bool llscSuccess,
                               const MachineType mach, const bool externalHit,
-@@ -242,6 +248,11 @@ class Sequencer : public RubyPort
+@@ -242,6 +258,14 @@ class Sequencer : public RubyPort
    protected:
      // RequestTable contains both read and write requests, handles aliasing
      std::unordered_map<Addr, std::list<SequencerRequest>> m_RequestTable;
@@ -681,15 +914,18 @@ index f530eb4..ae76724 100644
 +    // queued same-word no-return adds issued as one request, and per line the
 +    // number of CPU requests covered by the outstanding combined request.
 +    int m_dstateRequestCombine = 1;
++    int m_dstateDeltaMinWords = 0;
++    int m_dstateRangeLoMb = 0;
++    int m_dstateRangeHiMb = 0;
 +    std::unordered_map<Addr, int> m_dstateCombined;
      // UnadressedRequestTable contains "unaddressed" requests,
      // guaranteed not to alias each other
      std::unordered_map<uint64_t, SequencerRequest> m_UnaddressedRequestTable;
 diff --git a/src/mem/ruby/system/Sequencer.py b/src/mem/ruby/system/Sequencer.py
-index 49c6374..7f912c8 100644
+index 49c6374..f67fe81 100644
 --- a/src/mem/ruby/system/Sequencer.py
 +++ b/src/mem/ruby/system/Sequencer.py
-@@ -96,6 +96,11 @@ class RubySequencer(RubyPort):
+@@ -96,6 +96,21 @@ class RubySequencer(RubyPort):
      max_outstanding_requests = Param.Int(
          16, "max requests (incl. prefetches) outstanding"
      )
@@ -698,6 +934,16 @@ index 49c6374..7f912c8 100644
 +    dstate_request_combine = Param.Int(
 +        1, "max no-return adds to one word combined into one request"
 +    )
++    # Delta-line combining: queued adds to at least this many DIFFERENT words of
++    # one line are sent as one masked multi-word request. 0 disables it.
++    dstate_delta_min_words = Param.Int(
++        0, "min distinct words for a combined request to use the delta-line form"
++    )
++    # Static placement for oracle runs: when hi > lo, only no-return adds whose
++    # VIRTUAL address lies in [lo MB, hi MB) may be delegated; the rest are
++    # marked local-only and the L1 applies them through ownership.
++    dstate_range_lo_mb = Param.Int(0, "delegate only virtual addresses >= lo MB")
++    dstate_range_hi_mb = Param.Int(0, "delegate only virtual addresses < hi MB (0 = no range)")
      deadlock_threshold = Param.Cycles(
          500000,
          "max outstanding cycles for a request "

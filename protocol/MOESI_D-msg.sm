@@ -47,6 +47,7 @@
 enumeration(DStateOpType, desc="Implemented modular integer reductions") {
   IADD32, desc="32-bit modular add";
   IADD64, desc="64-bit modular add";
+  IADD_LINE, desc="masked multi-word modular add: 4-byte words in DStateMask32, 8-byte in DStateMask64";
 }
 
 // Per-bank executor model (src/mem/ruby/structures/DStateEngine.hh): bounded
@@ -60,6 +61,8 @@ structure(DStateEngine, external="yes") {
   bool hotWordHit(Addr, int);
   void hotWordTouch(Addr, int, int);
   void hotWordDrop(Addr);
+  void hotWordTouchMask(Addr, int, int, int);
+  bool masksValid(int, int);
   uint64_t nextId();
 }
 
@@ -72,6 +75,11 @@ structure(DStateMergeSet, external="yes") {
   uint64_t id(int);
   void popBack();
   void clear();
+  void setMasks(int, int, int, int);
+  bool masksCompatible(int, int);
+  void orMasks(int, int);
+  int mask32();
+  int mask64();
 }
 
 // CoherenceRequestType
@@ -103,6 +111,7 @@ enumeration(CoherenceResponseType, desc="...") {
   WB_NACK,           desc="Writeback neg. ack";
   DSTATE_ACK,       desc="D-state op applied and globally ordered (vnet2)";
   DSTATE_NACK,      desc="D-state op rejected, fallback GETX (vnet2)";
+  DATA_UNCACHED,    desc="Load snapshot of a retained (D) line; the requester installs no copy (far read)";
   DMA_ACK,           desc="Ack that a DMA write completed";
 }
 
@@ -119,6 +128,10 @@ structure(TriggerMsg, desc="...", interface="Message") {
 
   bool functionalRead(Packet *pkt) {
     // Trigger message does not hold data
+    return false;
+  }
+
+  bool functionalRead(Packet *pkt, WriteMask &mask) {
     return false;
   }
 
@@ -142,7 +155,9 @@ structure(RequestMsg, desc="...", interface="Message") {
   RubyAccessMode AccessMode,    desc="user/supervisor access type";
   PrefetchBit Prefetch,         desc="Is this a prefetch request";
   DStateOpType DStateOp,    desc="Mini-ALU op code (DSTATE_REQ only)";
-  int DStateOffset,         desc="Word offset within cache line for op";
+  int DStateOffset,         desc="Word offset within cache line for op (first word of a delta line)";
+  int DStateMask32, default="0", desc="4-byte words of DataBlk carrying an add (bit i -> offset 4i); 0 = use offset/Len";
+  int DStateMask64, default="0", desc="8-byte words of DataBlk carrying an add (bit k -> offset 8k)";
   uint64_t DStateId, default="0", desc="Per-requester transaction ID; echoed by ACK/NACK";
 
 
@@ -151,6 +166,16 @@ structure(RequestMsg, desc="...", interface="Message") {
     if (Type == CoherenceRequestType:WRITEBACK_CLEAN_DATA ||
         Type == CoherenceRequestType:WRITEBACK_DIRTY_DATA) {
         return testAndRead(addr, DataBlk, pkt);
+    }
+    return false;
+  }
+
+  // Garnet's in-flight functional read uses the masked form. A DSTATE_REQ's
+  // DataBlk is an operand (a delta), never line data, so it is not readable.
+  bool functionalRead(Packet *pkt, WriteMask &mask) {
+    if (Type == CoherenceRequestType:WRITEBACK_CLEAN_DATA ||
+        Type == CoherenceRequestType:WRITEBACK_DIRTY_DATA) {
+        return testAndReadMask(addr, DataBlk, mask, pkt);
     }
     return false;
   }
@@ -179,8 +204,18 @@ structure(ResponseMsg, desc="...", interface="Message") {
   bool functionalRead(Packet *pkt) {
     // Read only those messages that contain the data
     if (Type == CoherenceResponseType:DATA ||
-        Type == CoherenceResponseType:DATA_EXCLUSIVE) {
+        Type == CoherenceResponseType:DATA_EXCLUSIVE ||
+        Type == CoherenceResponseType:DATA_UNCACHED) {
         return testAndRead(addr, DataBlk, pkt);
+    }
+    return false;
+  }
+
+  bool functionalRead(Packet *pkt, WriteMask &mask) {
+    if (Type == CoherenceResponseType:DATA ||
+        Type == CoherenceResponseType:DATA_EXCLUSIVE ||
+        Type == CoherenceResponseType:DATA_UNCACHED) {
+        return testAndReadMask(addr, DataBlk, mask, pkt);
     }
     return false;
   }

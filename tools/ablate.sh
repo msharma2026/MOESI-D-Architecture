@@ -33,7 +33,7 @@ KN_FULL="DSTATE_QUEUE_DEPTH=8 DSTATE_INIT_INTERVAL=4 DSTATE_BUSY_STALL=1"
 matrix() { local name=$1 bin=$2 args=$3 cores=$4 cpu=$5; shift 5
   [ -d "$OUT/$name" ] && { echo "$name: exists, skipping"; return; }
   env "$@" python3 "$SRC/tools/run_matrix.py" --gem5-tree "$TREE" --binary "$W/bench/$bin" --workload-args "$args" \
-      --out "$OUT/$name" --cores "$cores" --banks 4 --cpu "$cpu" --repeats 1 --timeout "${TIMEOUT:-2400}" --modes "${MODES:-local,remote,persistent,forced-nack}" > "$OUT/$name.log" 2>&1
+      --out "$OUT/$name" --cores "$cores" --banks "${BANKS:-4}" --cpu "$cpu" --repeats 1 --timeout "${TIMEOUT:-2400}" --modes "${MODES:-local,remote,persistent,forced-nack}" > "$OUT/$name.log" 2>&1
   printf "%-34s %s/%s modes pass  %s\n" "$name" "$(grep -cE ' PASS$' "$OUT/$name.log")" "$(echo "${MODES:-local,remote,persistent,forced-nack}" | tr ',' '\n' | wc -l)" "$(grep -E ' FAIL' "$OUT/$name.log" | tr '\n' ' ')"; }
 # direct gem5 run for the ordering litmus (prints PASS/FAIL, not CORRECT)
 litmus() { local name=$1 bin=$2; shift 2
@@ -251,6 +251,145 @@ v3)
     MODES=$PERF3 matrix P5_phased512_16c_v3T scatter_phased "16 25 512 8" 16 X86O3CPU $KN_V3T &
     wait ;;
   esac ;;
+v4)
+  # Round four, one campaign on one build. New mechanisms (all default-off):
+  #   DSTATE_FAR_READS      a load of a line held in D gets a snapshot and no sharer is recorded
+  #   DSTATE_DELTA_MIN_WORDS queued adds to >= N different words of a line go as one delta-line request
+  #   DSTATE_RANGE_LO/HI_MB  static per-address placement (oracle runs on scatter_mixed)
+  #   DSTATE_MAX_OUTSTANDING per-core Ruby request limit (sweep at 16 cores)
+  # Columns: T/TH/R as in v3 (round-3 knobs, for isolation), T4/TH4/R4 = same + far reads
+  # (+ delta line in R4). Read-downgrade raised to 64 in the far-read columns so a read run
+  # between update bursts does not hand out cached copies.
+  #   usage: ablate.sh v4 gates|perf|apps|scale|mixed|regate|all
+  KN_V3="DSTATE_QUEUE_DEPTH=16 DSTATE_INIT_INTERVAL=4 DSTATE_BUSY_STALL=1 DSTATE_QUEUE_STALL=1 DSTATE_REQ_COMBINE=16 DSTATE_MERGE_LIMIT=64"
+  KN_V3T="$KN_V3 DSTATE_EXEC_LATENCY=20"
+  KN_V3TH="$KN_V3 DSTATE_HOTWORDS=32 DSTATE_HIT_LATENCY=4"
+  KN_V3R="$KN_V3TH DSTATE_RELAXED_AMO=1"
+  FAR="DSTATE_FAR_READS=1 DSTATE_READ_DOWNGRADE=64"
+  KN_T4="$KN_V3T $FAR"
+  KN_TH4="$KN_V3TH $FAR"
+  KN_R4="$KN_V3R $FAR DSTATE_DELTA_MIN_WORDS=2"
+  ORACLE_A="DSTATE_RANGE_LO_MB=512 DSTATE_RANGE_HI_MB=768"   # scatter_mixed: delegate the shared region only
+  PERF3="local,remote,persistent"
+  MTX=/home/ubuntu/moesi-d-work/bench/integer_fixture.mtx
+  case ${2:-all} in
+  gates)
+    matrix G18_regress_R4_fenced_o3    coherence_regression_fenced "" 5 X86O3CPU    $KN_R4  &
+    matrix G19_regress_TH4_minor       coherence_regression        "" 5 X86MinorCPU $KN_TH4 &
+    matrix G20_regress_T4_o3           coherence_regression        "" 5 X86O3CPU    $KN_T4  &
+    matrix G21_regress_R4_unfenced_o3  coherence_regression        "" 5 X86O3CPU    $KN_R4  &
+    wait
+    # far reads sit on the litmus reader's load of x; TSO rows must pass, L24 is the relaxed contract check
+    litmus L20_litmus_unfenced_T4         ordering_litmus        DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_T4 &
+    litmus L21_litmus_fenced_R4           ordering_litmus_fenced DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_R4 &
+    LITMUS_CPU=X86MinorCPU litmus L22_litmus_unfenced_TH4_minor ordering_litmus DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_TH4 &
+    litmus L23_litmus_lockadd_T4          ordering_litmus_lockadd DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_T4 &
+    litmus L24_litmus_unfenced_R4_RELAXED ordering_litmus        DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_R4 &
+    wait ;;
+  perf)
+    # read-interleaved single line: far reads are aimed here (v3 columns for isolation)
+    matrix Q0_rw800k_T4                scatter_rw     "4 200000 32 8" 4 X86O3CPU $KN_T4 &
+    matrix Q1_rw800k_R4                scatter_rw     "4 200000 32 8" 4 X86O3CPU $KN_R4 &
+    matrix Q2_scatter800k_R4           scatter_dstate "4 200000 32"   4 X86O3CPU $KN_R4 &
+    matrix Q3_hotkey800k_R4            scatter_dstate "4 200000 1"    4 X86O3CPU $KN_R4 &
+    wait
+    matrix Q4_multi512_T4              scatter_multi  "4 2000 512"    4 X86O3CPU $KN_T4 &
+    matrix Q5_multi512_R4              scatter_multi  "4 2000 512"    4 X86O3CPU $KN_R4 &
+    MODES=$PERF3 matrix Q6_phased512_T4 scatter_phased "4 50 512 8"   4 X86O3CPU $KN_T4 &
+    MODES=$PERF3 matrix Q7_phased512_R4 scatter_phased "4 50 512 8"   4 X86O3CPU $KN_R4 &
+    wait
+    MODES=$PERF3 matrix Q13_hotkey800k_8c_R4 scatter_dstate "8 100000 1"   8 X86O3CPU $KN_R4 &
+    MODES=$PERF3 matrix Q14_rw800k_8c_T4     scatter_rw     "8 100000 32 8" 8 X86O3CPU $KN_T4 &
+    wait ;;
+  mixed)
+    # Mixed regime: region A write-only shared lines, region B read-mostly shared lines
+    # (every thread reads all of B each iteration, one add per 8 iterations). The
+    # oracle delegates A only (virtual-address range, decided in the Sequencer); the
+    # dynamic policy may delegate anything and relies on far reads + read-downgrade.
+    # (The earlier Q8-Q12 runs used a first version of the program whose private
+    # lines never left their owner's L1, and a physical-address range that matched
+    # nothing; they are superseded by these.)
+    MODES=$PERF3 matrix M0_mixed_R4_all      scatter_mixed "4 20000 64 32 8" 4 X86O3CPU $KN_R4 &
+    MODES=$PERF3 matrix M1_mixed_R4_oracleA  scatter_mixed "4 20000 64 32 8" 4 X86O3CPU $KN_R4 $ORACLE_A &
+    MODES=$PERF3 matrix M2_mixed_T4_all      scatter_mixed "4 20000 64 32 8" 4 X86O3CPU $KN_T4 &
+    MODES=$PERF3 matrix M3_mixed_T4_oracleA  scatter_mixed "4 20000 64 32 8" 4 X86O3CPU $KN_T4 $ORACLE_A &
+    wait
+    MODES=$PERF3 matrix M4_mixed_R3_all      scatter_mixed "4 20000 64 32 8" 4 X86O3CPU $KN_V3R &
+    MODES=$PERF3 matrix M5_mixed_R4_nofar    scatter_mixed "4 20000 64 32 8" 4 X86O3CPU $KN_V3R DSTATE_DELTA_MIN_WORDS=2 &
+    wait
+    export TIMEOUT=7200
+    BUF16="DSTATE_BUFFER_SIZE=${BUF16:-256}"
+    MODES=$PERF3 matrix M6_mixed_16c_R4_all     scatter_mixed "16 5000 64 32 8" 16 X86O3CPU $KN_R4 $BUF16 &
+    MODES=$PERF3 matrix M7_mixed_16c_R4_oracleA scatter_mixed "16 5000 64 32 8" 16 X86O3CPU $KN_R4 $BUF16 $ORACLE_A &
+    wait ;;
+  regate)
+    # the static-placement change touched the L1 mandatory path: re-gate on the final build
+    matrix G22_regress_R4_fenced_o3_final coherence_regression_fenced "" 5 X86O3CPU    $KN_R4  &
+    matrix G23_regress_T4_o3_final        coherence_regression        "" 5 X86O3CPU    $KN_T4  &
+    matrix G24_regress_TH4_minor_final    coherence_regression        "" 5 X86MinorCPU $KN_TH4 &
+    wait
+    litmus L25_litmus_unfenced_T4_final   ordering_litmus        DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_T4 &
+    litmus L26_litmus_fenced_R4_final     ordering_litmus_fenced DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_R4 &
+    wait ;;
+  apps)
+    # the v1.0.0 paper's programs on the corrected protocol (first time)
+    MODES=$PERF3 matrix A0_cms_R4       cms_dstate    "4 20000"       4 X86O3CPU $KN_R4 &
+    MODES=$PERF3 matrix A1_cms_T4       cms_dstate    "4 20000"       4 X86O3CPU $KN_T4 &
+    MODES=$PERF3 matrix A2_zipf_R4      litmus_dstate "4 4000 2048"   4 X86O3CPU $KN_R4 &
+    MODES=$PERF3 matrix A3_zipf_T4      litmus_dstate "4 4000 2048"   4 X86O3CPU $KN_T4 &
+    wait
+    for col in R4 T4; do
+      kn=$KN_R4; [ $col = T4 ] && kn=$KN_T4
+      name=A4_spmv_$col; [ $col = T4 ] && name=A5_spmv_$col
+      [ -d "$OUT/$name" ] || env $kn python3 "$SRC/tools/run_matrix.py" --gem5-tree "$TREE" --binary "$W/bench/spmv_dstate" \
+          --workload-args "4 20 $MTX" --input "$MTX" --out "$OUT/$name" --cores 4 --banks 4 --cpu X86O3CPU --repeats 1 \
+          --timeout 2400 --modes $PERF3 > "$OUT/$name.log" 2>&1 &
+    done
+    wait
+    for n in A4_spmv_R4 A5_spmv_T4; do printf "%-34s %s/3 modes pass\n" $n "$(grep -cE ' PASS$' "$OUT/$n.log")"; done ;;
+  apps2)
+    # CMS again (its conventional relaxed run hit gem5's missing Garnet functional
+    # read, fixed in the patch), the Zipfian program at 25x the adds, and SpMV on a
+    # synthetic 4096x4096 / 65,536-nnz integer matrix (bench/gen_integer_matrix.py
+    # 4096 65536 1); SpMV partitions rows per thread, so it is the single-writer
+    # negative control.
+    SYN=$W/bench/synth_4096_65536_s1.mtx
+    [ -f "$SYN" ] || python3 "$SRC/bench/gen_integer_matrix.py" 4096 65536 1 > "$SYN"
+    MODES=$PERF3 matrix A6_cms_R4_fr       cms_dstate    "4 20000"        4 X86O3CPU $KN_R4 &
+    MODES=$PERF3 matrix A7_zipf100k_R4     litmus_dstate "4 100000 2048"  4 X86O3CPU $KN_R4 &
+    MODES=$PERF3 matrix A8_zipf100k_T4     litmus_dstate "4 100000 2048"  4 X86O3CPU $KN_T4 &
+    wait
+    for col in R4 T4; do
+      kn=$KN_R4; [ $col = T4 ] && kn=$KN_T4
+      name=A9_spmv_synth_$col; [ $col = T4 ] && name=A10_spmv_synth_$col
+      [ -d "$OUT/$name" ] || env $kn python3 "$SRC/tools/run_matrix.py" --gem5-tree "$TREE" --binary "$W/bench/spmv_dstate" \
+          --workload-args "4 50 $SYN" --input "$SYN" --out "$OUT/$name" --cores 4 --banks 4 --cpu X86O3CPU --repeats 1 \
+          --timeout 2400 --modes $PERF3 > "$OUT/$name.log" 2>&1 &
+    done
+    wait
+    for n in A9_spmv_synth_R4 A10_spmv_synth_T4; do printf "%-34s %s/3 modes pass\n" $n "$(grep -cE ' PASS$' "$OUT/$n.log")"; done ;;
+  scale)
+    export TIMEOUT=7200
+    BUF16="DSTATE_BUFFER_SIZE=${BUF16:-256}"
+    # is the 16-core relaxed ceiling the per-core request limit or the banks?
+    MODES=$PERF3 matrix S0_multi512_16c_R4            scatter_multi "16 500 512" 16 X86O3CPU $KN_R4 $BUF16 &
+    MODES=$PERF3 matrix S1_multi512_16c_R4_out32      scatter_multi "16 500 512" 16 X86O3CPU $KN_R4 $BUF16 DSTATE_MAX_OUTSTANDING=32 &
+    wait
+    MODES=$PERF3 matrix S2_multi512_16c_R4_out64      scatter_multi "16 500 512" 16 X86O3CPU $KN_R4 $BUF16 DSTATE_MAX_OUTSTANDING=64 &
+    MODES=$PERF3 BANKS=8 matrix S3_multi512_16c_R4_8banks scatter_multi "16 500 512" 16 X86O3CPU $KN_R4 $BUF16 &
+    wait
+    MODES=$PERF3 matrix S4_hotkey800k_16c_TH4         scatter_dstate "16 50000 1"    16 X86O3CPU $KN_TH4 $BUF16 &
+    MODES=$PERF3 matrix S5_rw800k_16c_R4              scatter_rw     "16 50000 32 8" 16 X86O3CPU $KN_R4  $BUF16 &
+    wait
+    MODES=$PERF3 matrix S6_rw800k_16c_T4              scatter_rw     "16 50000 32 8" 16 X86O3CPU $KN_T4  $BUF16 &
+    MODES=$PERF3 matrix S7_phased512_16c_R4           scatter_phased "16 25 512 8"   16 X86O3CPU $KN_R4  $BUF16 &
+    wait
+    MODES=$PERF3 matrix S8_phased512_16c_T4           scatter_phased "16 25 512 8"   16 X86O3CPU $KN_T4  $BUF16 &
+    MODES=$PERF3 matrix S11_hotkey800k_16c_R4         scatter_dstate "16 50000 1"    16 X86O3CPU $KN_R4  $BUF16 &
+    wait ;;
+  all)
+    for ph in gates perf apps scale mixed regate; do echo "--- $ph $(date +%H:%M)"; bash "$0" v4 $ph; done ;;
+  esac ;;
 report)
   # One row per (run, mode). Update/response message counts come from the L1's terminal
   # ACK/NACK counters (Garnet emits no per-size-class msg_count); newBytes uses the derived
@@ -276,5 +415,5 @@ report)
              n, mode, s, fl, pk, r, b, c, h, k+km, mg, km, u32, rs }' "$m/stats.txt"
     done
   done ;;
-*) echo "usage: GEM5_TREE=... OUT=... $0 gates|perf|rw|multi|final|report | v2 gates|scatter|rw|multi|hotkey|long | v3 gates|perf|ws|scale|phased" ;;
+*) echo "usage: GEM5_TREE=... OUT=... $0 gates|perf|rw|multi|final|report | v2 gates|scatter|rw|multi|hotkey|long | v3 gates|perf|ws|scale|phased | v4 gates|perf|apps|scale|mixed|regate|all" ;;
 esac

@@ -113,6 +113,7 @@ machine(MachineType:L1Cache, "L1 cache protocol")
     DState_Retry, desc="Inject fallback after the NACK response queue has drained";
     DState_ACK,  desc="D-state operation applied at home";
     DState_NACK, desc="D-state op rejected, retry via GETX";
+    Data_Uncached, desc="Snapshot data for a load (far read); nothing is installed";
     LocalAtomic_CPU, desc="Same no-return operation with delegation disabled";
     DStateReq_CPU, desc="CPU issued ATOMIC_NO_RETURN (delegatable reduction)";
     DStateReq_CPU_S, desc="Delegatable reduction while holding the line read-only; delegate and drop the copy";
@@ -306,13 +307,15 @@ machine(MachineType:L1Cache, "L1 cache protocol")
     return num_functional_writes;
   }
 
-  Event mandatory_request_type_to_event(RubyRequestType type) {
+  // localOnly: the sequencer's static-placement range (oracle runs) excludes this
+  // add; it takes the conventional ownership path like DSTATE_ENABLED=0 would.
+  Event mandatory_request_type_to_event(RubyRequestType type, bool localOnly) {
     if (type == RubyRequestType:LD) {
       return Event:Load;
     } else if (type == RubyRequestType:IFETCH) {
       return Event:Ifetch;
     } else if (type == RubyRequestType:ATOMIC_NO_RETURN) {
-      if (d_state_enabled) { return Event:DStateReq_CPU; }
+      if (d_state_enabled && localOnly == false) { return Event:DStateReq_CPU; }
       return Event:LocalAtomic_CPU;
     } else if ((type == RubyRequestType:ST) || (type == RubyRequestType:ATOMIC) ||
                (type == RubyRequestType:ATOMIC_RETURN)) {
@@ -390,6 +393,9 @@ machine(MachineType:L1Cache, "L1 cache protocol")
         } else if (in_msg.Type == CoherenceResponseType:DSTATE_NACK) {
           trigger(Event:DState_NACK, in_msg.addr,
                   getCacheEntry(in_msg.addr), TBEs[in_msg.addr]);
+        } else if (in_msg.Type == CoherenceResponseType:DATA_UNCACHED) {
+          trigger(Event:Data_Uncached, in_msg.addr,
+                  getCacheEntry(in_msg.addr), TBEs[in_msg.addr]);
         } else {
           error("Unexpected message");
         }
@@ -442,7 +448,7 @@ machine(MachineType:L1Cache, "L1 cache protocol")
           Entry L1Icache_entry := getL1ICacheEntry(in_msg.LineAddress);
           if (is_valid(L1Icache_entry)) {
             // The tag matches for the L1, so the L1 asks the L2 for it.
-            trigger(mandatory_request_type_to_event(in_msg.Type),
+            trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly),
                     in_msg.LineAddress, L1Icache_entry,
                     TBEs[in_msg.LineAddress]);
           } else {
@@ -456,7 +462,7 @@ machine(MachineType:L1Cache, "L1 cache protocol")
             }
             if (L1Icache.cacheAvail(in_msg.LineAddress)) {
               // L1 does't have the line, but we have space for it in the L1 so let's see if the L2 has it
-              trigger(mandatory_request_type_to_event(in_msg.Type),
+              trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly),
                       in_msg.LineAddress, L1Icache_entry,
                       TBEs[in_msg.LineAddress]);
             } else {
@@ -478,12 +484,13 @@ machine(MachineType:L1Cache, "L1 cache protocol")
             // The tag matches for the L1, so the L1 ask the L2 for it
             State dst := getState(TBEs[in_msg.LineAddress], L1Dcache_entry, in_msg.LineAddress);
             if (in_msg.Type == RubyRequestType:ATOMIC_NO_RETURN && d_state_enabled &&
-                d_state_delegate_from_s && dst == State:S) {
+                d_state_delegate_from_s && in_msg.DStateLocalOnly == false &&
+                dst == State:S) {
               // Hold read-only: delegate rather than upgrade (knob).
               trigger(Event:DStateReq_CPU_S, in_msg.LineAddress, L1Dcache_entry,
                       TBEs[in_msg.LineAddress]);
             } else {
-              trigger(mandatory_request_type_to_event(in_msg.Type),
+              trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly),
                       in_msg.LineAddress, L1Dcache_entry,
                       TBEs[in_msg.LineAddress]);
             }
@@ -498,7 +505,7 @@ machine(MachineType:L1Cache, "L1 cache protocol")
             }
             if (L1Dcache.cacheAvail(in_msg.LineAddress)) {
               // L1 does't have the line, but we have space for it in the L1 let's see if the L2 has it
-              trigger(mandatory_request_type_to_event(in_msg.Type),
+              trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly),
                       in_msg.LineAddress, L1Dcache_entry,
                       TBEs[in_msg.LineAddress]);
             } else {
@@ -732,6 +739,13 @@ machine(MachineType:L1Cache, "L1 cache protocol")
     L1Icache.setMRU(address);
     L1Dcache.setMRU(address);
     sequencer.readCallback(address, cache_entry.DataBlk, true);
+  }
+
+  action(hu_load_hit_uncached, "hu", desc="Far read: complete the load(s) from the snapshot; install nothing") {
+    peek(responseToL1Cache_in, ResponseMsg) {
+      DataBlock snapshot := in_msg.DataBlk;
+      sequencer.readCallback(address, snapshot, true);
+    }
   }
 
   action(hh_store_hit, "\h", desc="Notify sequencer that store completed.") {
@@ -1016,7 +1030,20 @@ machine(MachineType:L1Cache, "L1 cache protocol")
         out_msg.Destination.add(mapAddressToMachine(address, MachineType:L2Cache));
         // Size class follows the operand width; byte budgets are derived in
         // RubySlicc_Exports.sm next to the MessageSizeType entries.
-        if (in_msg.Size == 8) {
+        if (in_msg.DStateWords > 1) {
+          // Delta line: the sequencer combined adds to several words of this
+          // line (DSTATE_REQ_COMBINE / dstate_delta_min_words); masks say which.
+          out_msg.DStateOp := DStateOpType:IADD_LINE;
+          if (in_msg.DStateWords <= 4) {
+            out_msg.MessageSize := MessageSizeType:DState_UpdateW4;
+          } else if (in_msg.DStateWords <= 8) {
+            out_msg.MessageSize := MessageSizeType:DState_UpdateW8;
+          } else if (in_msg.DStateWords <= 16) {
+            out_msg.MessageSize := MessageSizeType:DState_UpdateW16;
+          } else {
+            out_msg.MessageSize := MessageSizeType:DState_UpdateW32;
+          }
+        } else if (in_msg.Size == 8) {
           out_msg.DStateOp := DStateOpType:IADD64;
           out_msg.MessageSize := MessageSizeType:DState_Update64;
         } else {
@@ -1025,6 +1052,8 @@ machine(MachineType:L1Cache, "L1 cache protocol")
         }
         out_msg.Len := in_msg.Size;
         out_msg.DStateOffset := getOffset(in_msg.PhysicalAddress);
+        out_msg.DStateMask32 := in_msg.DStateMask32;
+        out_msg.DStateMask64 := in_msg.DStateMask64;
         out_msg.DataBlk := in_msg.WTData;
       }
     }
@@ -1374,6 +1403,14 @@ machine(MachineType:L1Cache, "L1 cache protocol")
     m_decrementNumberOfMessages;
     hx_load_hit;
     g_sendUnblock;
+    s_deallocateTBE;
+    n_popResponseQueue;
+  }
+  // Far read: the home answered from a retained line and recorded no sharer, so
+  // nothing is installed, no unblock is owed, and the block goes back to I.
+  transition(IS, Data_Uncached, I) {
+    hu_load_hit_uncached;
+    kk_deallocateL1CacheBlock;
     s_deallocateTBE;
     n_popResponseQueue;
   }

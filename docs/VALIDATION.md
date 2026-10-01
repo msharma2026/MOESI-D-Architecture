@@ -113,6 +113,57 @@ buffers (`DSTATE_BUFFER_SIZE=256`) in every mode, and completed; the two 32-entr
 or starvation was not resolved (three diagnostic runs were lost to a host-side
 kill); the delegated modes are not implicated either way.
 
+### Round 4 (2026-10-01 build): far reads, delta-line requests, static placement
+
+Mechanisms: far reads (`DSTATE_FAR_READS`: a load of a line held in D gets a
+snapshot and no sharer is recorded; `IS + Data_Uncached -> I` at the L1,
+`D + L1_GETS_Far -> D` at the L2), delta-line requests (`DSTATE_DELTA_MIN_WORDS`:
+one masked multi-word request; mask-based merging at the bank), and static
+placement by virtual-address range for oracle runs (`DSTATE_RANGE_LO_MB/HI_MB`,
+decided in the Sequencer). `tests/check_artifact.py` 9/9 after export.
+
+Gates on the round-4 build, every mode CORRECT and through the coverage gate:
+
+| Check | Result |
+|---|---|
+| `coherence_regression_fenced`, O3, relaxed + far reads + delta lines (G18) | 4/4; 2,062 far reads served |
+| `coherence_regression`, Minor, TSO + far reads (G19); O3, TSO + far reads (G20) | 4/4 each; 2,093 far reads in G20 |
+| `coherence_regression` unfenced, O3, relaxed (G21, contract check) | 4/4 this time; still not a gate |
+| `ordering_litmus` unfenced TSO (O3 L20, Minor L22), fenced relaxed (L21), stock `lock addl` (L23), unfenced relaxed contract check (L24) | 0 forbidden, 0 lost in all five |
+| re-gate after the static-placement change to the L1 mandatory path (G22–G24, L25–L26) | 4/4, 4/4, 4/4; 0 forbidden |
+
+Three findings that changed the campaign, none of them in the protocol:
+
+1. **The first static-placement knob matched nothing.** It compared Ruby's
+   *physical* line address with a range of the benchmark's *virtual* mapping, so
+   the oracle runs (Q9, Q11, S10) delegated no line at all and failed coverage.
+   The decision moved into the Sequencer, which has the packet's virtual address;
+   those runs are archived as superseded and were repeated (M-series).
+2. **gem5's Garnet has no unmasked functional read.** A syscall's functional
+   access to a line whose only copy is in flight reaches
+   `Network::functionalRead(Packet*)`, which Garnet leaves at the base-class
+   `fatal("Functional read not implemented")`. The conventional (`DSTATE_ENABLED=0`)
+   relaxed-ordering CMS run died this way (A0 local). The patch adds the method
+   (same semantics as SimpleNetwork's); the repeat (A6) then reached the next
+   missing layer, the per-message masked `functionalRead(Packet, WriteMask)` that
+   the MOESI_CMP_directory family never defined, so the protocol's three message
+   types now define it too (a `DSTATE_REQ`'s data block is an operand, never line
+   data, and is not readable). The second repeat (A11) then failed one layer
+   deeper, `Ruby functional read failed for address ...`: at the moment of the
+   syscall's functional access no controller or message held a readable copy of
+   the line (a store in transit on the conventional relaxed path), which gem5's
+   SE mode cannot resolve. That is a simulator limitation, not something the
+   patch should paper over, so the CMS relaxed column has no conventional
+   baseline; its TSO column (A1) is complete. The delegated modes never hit any
+   of the three gaps.
+3. **The first mixed-regime program could not test the policy**: its "read then
+   add" lines were private to one core, so they never left that core's L1 and the
+   placement question never arose. The second version makes region B shared
+   read-mostly lines (every thread reads them every iteration, one rare writer);
+   results in the results file. The checked-in SpMV fixture is a 4×4 correctness
+   case; the SpMV rows use a generated 4096×4096 / 65,536-nnz integer matrix
+   (`bench/gen_integer_matrix.py 4096 65536 1`, SHA-256 `e435b27da80f6eca…`).
+
 ### Measurement caveats that apply to every number
 
 - **Whole-program `simSeconds`, no ROI.** `libm5` was not built, so times include

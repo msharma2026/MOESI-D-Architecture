@@ -58,6 +58,13 @@ holds, what changed in the implementation, and where the current evidence is.
   fences where it publishes. Correctness tests for that mode use the fenced
   guest binaries; the unfenced ones are contract checks that may observe the
   permitted reorder.
+- `DSTATE_FAR_READS`: a load of a line held in D is answered with a snapshot and
+  no sharer is recorded; the line stays at the home across reads. Read-heavy
+  lines fall back to ordinary cached copies after `DSTATE_READ_DOWNGRADE` reads
+  with no update.
+- `DSTATE_DELTA_MIN_WORDS`: queued adds to several words of one line are sent as
+  one masked delta-line request; bank-side merging is mask-based.
+- `DSTATE_RANGE_LO_MB`/`HI_MB`: static per-address placement for oracle runs.
 - `DSTATE_REQ_COMBINE`: the Sequencer issues queued same-word no-return adds
   from one core as a single summed request once the previous request to that
   line completes; all of them complete on its ACK. Only a consecutive run of

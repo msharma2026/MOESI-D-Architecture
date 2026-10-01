@@ -18,18 +18,16 @@ and store-ordering tests pass on O3 and Minor with the delegated path exercised
 in every mode ([validation record](docs/VALIDATION.md)). Same-binary ablations
 are in [`results/ABLATION_2026-09-30.md`](results/ABLATION_2026-09-30.md). The
 shipped one-op-per-bank admission made delegation slower than the conventional
-path. With the executor knobs below (bounded admission, pipelining,
-back-pressure, combining), on 512 to 8,192 hot lines every update delegates with
-about 7× fewer flits: **20–21% faster** than the matched conventional path under
-TSO at 4, 8 and 16 cores, and **3.0–3.35× faster** when both sides use the relaxed
-no-return ordering of Intel RAO-INT (`DSTATE_RELAXED_AMO=1`) — 2.3× at 16 cores,
-where four banks become the limit. On a single hot word, requester-side combining
-takes the delegated path from 37% slower to a tie at 4 cores and **1.6× faster at
-16 cores** under relaxed ordering; under TSO the owner stays ahead (+13% at 8
-cores). The retention policy (D) helps only on phased update/read workloads:
-1–7% at 4 cores and 24–33% at 16 cores over home execution without retention.
-Whole-program, single deterministic runs on a 4-bank model; not an application
-speedup.
+path. With the mechanisms below, on 512 to 8,192 hot lines every update delegates
+with about 7× fewer flits: **20–21% faster** than the matched conventional path
+under TSO at 4, 8 and 16 cores, and **3.0–3.35× faster** when both sides use the
+relaxed no-return ordering of Intel RAO-INT (`DSTATE_RELAXED_AMO=1`); 2.3–2.5× at
+16 cores on 4–8 banks. A single hot word is a tie at 4 cores and **1.4× (TSO) to
+1.6× (relaxed) faster at 16 cores**. The retention policy (D) earns its keep
+through **far reads**: the read-interleaved single line, 3.2× slower in round 3,
+is 18% slower at 4 cores and **2.2× faster at 16 cores**; phased update/read
+workloads gain 8–28% from retention at 16 cores. Whole-program, single
+deterministic runs; not an application speedup.
 
 ## What changed since v1.0.0
 
@@ -123,6 +121,10 @@ ROI instrumentation and performance acceptance criteria.
 | `DSTATE_RELAXED_AMO` | 0 | 1 (O3 only): no-return atomics bypass TSO's one-store-in-flight rule, Intel RAO-INT style; fence where you publish |
 | `DSTATE_REQ_COMBINE` | 1 | Queued same-word no-return adds a core issues as one summed request once the previous request to that line completes; 1 disables |
 | `DSTATE_QUEUE_STALL` | 0 | 1: a request that finds the bank executor full waits in the input buffer for a released slot instead of being NACKed to the GETX path |
+| `DSTATE_FAR_READS` | 0 | 1: a load of a line held in D is answered with a snapshot and no sharer is recorded, so the next update needs no invalidation; after `DSTATE_READ_DOWNGRADE` reads with no update the line takes the ordinary cached path |
+| `DSTATE_DELTA_MIN_WORDS` | 0 | Queued adds to at least this many different words of one line are sent as one masked delta-line request (32–144 B by word count); 0 disables |
+| `DSTATE_RANGE_LO_MB` / `_HI_MB` | 0 / 0 | When hi > lo, only adds to virtual addresses in [lo MB, hi MB) are delegated (static placement for oracle runs) |
+| `DSTATE_MAX_OUTSTANDING` | 16 | Per-core outstanding Ruby requests (gem5 default); applies to every mode |
 | `DSTATE_BUFFER_SIZE` | 32 | Entries per configured endpoint/trigger buffer |
 | `DSTATE_TBES` | 16 | L1/L2 controller TBE count |
 | `DSTATE_THRESHOLD` | 4 | Saturating accepted-update count needed for promotion |

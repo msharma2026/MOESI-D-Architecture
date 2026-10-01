@@ -35,9 +35,46 @@ inline void dstateAdd(std::uint8_t *data, const std::uint8_t *operand,
         data[offset + byte] = std::uint8_t(value >> (8 * byte));
 }
 
+// Word masks for multi-word (delta-line) operations: bit i of mask32 marks the
+// 4-byte slot at offset 4i, bit k of mask64 the 8-byte slot at offset 8k. A
+// request is well formed when no byte is claimed at both widths.
+inline std::uint32_t dstateMask64As32(std::uint32_t m64)
+{
+    std::uint32_t out = 0;
+    for (int k = 0; k < 16; ++k)
+        if ((m64 >> k) & 1u) out |= 3u << (2 * k);
+    return out;
+}
+inline bool dstateMasksDisjoint(std::uint32_t a32, std::uint32_t a64,
+                                std::uint32_t b32, std::uint32_t b64)
+{
+    return (a32 & dstateMask64As32(b64)) == 0 && (b32 & dstateMask64As32(a64)) == 0;
+}
+inline void dstateAddMasked(std::uint8_t *data, const std::uint8_t *operand,
+                            int blockSize, std::uint32_t m32, std::uint32_t m64)
+{
+    for (int i = 0; i < 32; ++i)
+        if ((m32 >> i) & 1u) dstateAdd(data, operand, blockSize, 4 * i, 4);
+    for (int k = 0; k < 16; ++k)
+        if ((m64 >> k) & 1u) dstateAdd(data, operand, blockSize, 8 * k, 8);
+}
+
 class DStateEngine
 {
   public:
+    // One request's own masks must not claim a byte at both widths.
+    bool masksValid(int m32, int m64) const
+    {
+        return dstateMasksDisjoint(std::uint32_t(m32), 0, 0, std::uint32_t(m64)) &&
+               (m32 != 0 || m64 != 0);
+    }
+    void hotWordTouchMask(std::uint64_t line, int m32, int m64, int capacity)
+    {
+        for (int i = 0; i < 32; ++i)
+            if ((std::uint32_t(m32) >> i) & 1u) hotWordTouch(line, 4 * i, capacity);
+        for (int k = 0; k < 16; ++k)
+            if ((std::uint32_t(m64) >> k) & 1u) hotWordTouch(line, 8 * k, capacity);
+    }
     // Admission: at most `capacity` accepted operations in flight per bank.
     bool hasCapacity(int capacity) const { return inflight < capacity; }
     int occupancy() const { return inflight; }

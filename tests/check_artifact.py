@@ -101,8 +101,8 @@ class ArtifactChecks(unittest.TestCase):
         L2 parks (never drops) a request that finds the executor full."""
         seq = (ROOT / "protocol/ruby-integration.patch").read_text(encoding="utf-8")
         for needle in ("Sequencer::issueFront",
-                       "it->pkt->getAddr() != addr",
-                       "it->pkt->getSize() != size",
+                       "if (frontRunOpen && off == frontOff && size == frontSize)",
+                       "it->m_type != RubyRequestType_ATOMIC_NO_RETURN || !it->pkt->isAtomicOp()",
                        "m_dstateCombined.erase(address);",
                        "dstate_request_combine"):
             self.assertIn(needle, seq)
@@ -112,6 +112,26 @@ class ArtifactChecks(unittest.TestCase):
         self.assertIn("void wakeUpAllBuffers();", l2)
         # both executor-release actions wake the parked requests
         self.assertEqual(l2.count("      wakeUpAllBuffers();"), 2)
+
+
+    def test_far_reads_and_delta_line_guards(self):
+        """Round 4: far reads install nothing at the L1 and record no sharer at
+        the L2; delta-line requests are validated and merged by word masks."""
+        l1 = (ROOT / "protocol/MOESI_D-L1cache.sm").read_text(encoding="utf-8")
+        l2 = (ROOT / "protocol/MOESI_D-L2cache.sm").read_text(encoding="utf-8")
+        self.assertIn("transition(IS, Data_Uncached, I)", l1)
+        self.assertIn("kk_deallocateL1CacheBlock", l1.split("transition(IS, Data_Uncached, I)")[1][:200])
+        self.assertIn("transition(D, L1_GETS_Far, D)", l2)
+        snap = l2.split("action(d_sendSnapshotToL1GETS")[1][:400]
+        self.assertIn("assert(cache_entry.Sharers.count() == 0)", snap)
+        self.assertIn("dStateEngine.masksValid(in_msg.DStateMask32, in_msg.DStateMask64)", l2)
+        self.assertIn("ptbe.DStateMerged.masksCompatible(in_msg.DStateMask32, in_msg.DStateMask64)", l2)
+        self.assertIn("applyDStateAddMasked(tbe.DStateOperand", l2)
+        seq = (ROOT / "protocol/ruby-integration.patch").read_text(encoding="utf-8")
+        for needle in ("dstate_delta_min_words", "struct DStateCombinedOp",
+                       "w.first < off + size && off < w.first + w.second.size",
+                       "m_DStateWords = combined->words"):
+            self.assertIn(needle, seq)
 
 
 if __name__ == "__main__":

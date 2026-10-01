@@ -108,8 +108,17 @@ def create_system(
     busy_stall = flag_env("DSTATE_BUSY_STALL", "0")
     # Back-pressure instead of NACK when the bank executor is full.
     queue_stall = flag_env("DSTATE_QUEUE_STALL", "0")
+    # Far reads: loads of a retained line get a snapshot, no sharer is recorded.
+    far_reads = flag_env("DSTATE_FAR_READS", "0")
+    # Static placement (oracle runs): delegate only VIRTUAL addresses in [lo, hi) MB.
+    range_lo = bounded_env("DSTATE_RANGE_LO_MB", "0", 0, 1 << 30)
+    range_hi = bounded_env("DSTATE_RANGE_HI_MB", "0", 0, 1 << 30)
+    # Per-core outstanding Ruby requests (gem5 default 16); applies to every mode.
+    max_outstanding = bounded_env("DSTATE_MAX_OUTSTANDING", "16", 1, 1024)
     # Requester-side combining: queued same-word adds per issued request (1 = off).
     req_combine = bounded_env("DSTATE_REQ_COMBINE", "1", 1, 64)
+    # Delta-line form once a combined request spans this many distinct words (0 = off).
+    delta_min_words = bounded_env("DSTATE_DELTA_MIN_WORDS", "0", 0, 32)
     # Service-model and combining knobs (all default to the shipped behaviour).
     # 0 hit latency selects "equal to the service latency" (no hot-word benefit).
     hit_latency = bounded_env("DSTATE_HIT_LATENCY", "0", 0, 65535) or exec_latency
@@ -177,6 +186,10 @@ def create_system(
 
         cpu_seq = RubySequencer(
             dstate_request_combine=req_combine,
+            dstate_delta_min_words=delta_min_words,
+            dstate_range_lo_mb=range_lo,
+            dstate_range_hi_mb=range_hi,
+            max_outstanding_requests=max_outstanding,
             version=i,
             dcache=l1d_cache,
             clk_domain=clk_domain,
@@ -248,6 +261,7 @@ def create_system(
             d_state_init_interval=init_interval,
             d_state_busy_stall=busy_stall,
             d_state_queue_stall=queue_stall,
+            d_state_far_reads=far_reads,
             d_state_hit_latency=hit_latency,
             d_state_hotwords=hotwords,
             d_state_merge_limit=merge_limit,

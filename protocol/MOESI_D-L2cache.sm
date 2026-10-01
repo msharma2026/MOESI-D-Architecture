@@ -63,6 +63,12 @@ machine(MachineType:L2Cache, "Token protocol")
   // finite input buffer and wake it when a slot is released, instead of NACKing
   // it into a full ownership migration. Default off (reject, as shipped).
   bool d_state_queue_stall := "False";
+  // Far reads: a local load of a line held in D is answered with a snapshot of
+  // the data and NO sharer is recorded, so the next update needs no invalidation
+  // and the line never leaves the home. After read_downgrade_threshold reads
+  // with no intervening update the line is judged read-heavy and the next load
+  // takes the ordinary path (a cached copy). Default off.
+  bool d_state_far_reads := "False";
   //   hit_latency   service time when the target word is in the bank's hot-word
   //                 buffer (registers, not the SRAM array); default = full latency
   //   hotwords      hot-word buffer entries per bank; 0 disables the model
@@ -192,6 +198,7 @@ machine(MachineType:L2Cache, "Token protocol")
     DState_Reject, desc="Pre-acceptance rejection: no mutation or future execution";
     DState_Busy, desc="Line is acquiring or executing another update; wait, do not reject";
     DState_Full, desc="Executor at capacity; wait for a released slot instead of rejecting";
+    L1_GETS_Far, desc="Local load of a retained (D) line answered with a snapshot; no sharer recorded";
     DState_Merge, desc="Same-word update folded into the pending accepted operation";
     DState_CompleteMerged, desc="Service time elapsed for an operation with merged requesters";
     DState_AckMore, desc="Acknowledge the next merged requester";
@@ -826,8 +833,17 @@ machine(MachineType:L2Cache, "Token protocol")
           trigger(Event:L1_GETX, in_msg.addr,
                   getCacheEntry(in_msg.addr), TBEs[in_msg.addr]);
         } else if (in_msg.Type == CoherenceRequestType:GETS) {
-            trigger(Event:L1_GETS, in_msg.addr,
-                  getCacheEntry(in_msg.addr), TBEs[in_msg.addr]);
+          Entry rce := getCacheEntry(in_msg.addr);
+          State rst := getState(TBEs[in_msg.addr], rce, in_msg.addr);
+          // Far read: serve a snapshot from a retained line and keep it; once the
+          // read run reaches the downgrade threshold the line is read-heavy and
+          // the ordinary (cached-copy) path is taken instead.
+          if (d_state_far_reads && is_valid(rce) && rst == State:D &&
+              rce.DStateReadRun < d_state_read_downgrade_threshold) {
+            trigger(Event:L1_GETS_Far, in_msg.addr, rce, TBEs[in_msg.addr]);
+          } else {
+            trigger(Event:L1_GETS, in_msg.addr, rce, TBEs[in_msg.addr]);
+          }
         } else if (in_msg.Type == CoherenceRequestType:PUTO) {
           trigger(Event:L1_PUTO, in_msg.addr,
                   getCacheEntry(in_msg.addr), TBEs[in_msg.addr]);
@@ -872,7 +888,10 @@ machine(MachineType:L2Cache, "Token protocol")
           Entry ce := getCacheEntry(in_msg.addr);
           State st := getState(TBEs[in_msg.addr], ce, in_msg.addr);
           bool format_ok := ((in_msg.DStateOp == DStateOpType:IADD32 && in_msg.Len == 4) ||
-                             (in_msg.DStateOp == DStateOpType:IADD64 && in_msg.Len == 8));
+                             (in_msg.DStateOp == DStateOpType:IADD64 && in_msg.Len == 8) ||
+                             (in_msg.DStateOp == DStateOpType:IADD_LINE &&
+                              dStateEngine.masksValid(in_msg.DStateMask32, in_msg.DStateMask64)));
+          bool scalar_op := in_msg.DStateOp != DStateOpType:IADD_LINE;
           bool owner_ok := (st == State:I || st == State:M || st == State:D ||
                             st == State:ILX || st == State:ILOX);
           if (st == State:OLSX && is_valid(ce)) {
@@ -895,8 +914,7 @@ machine(MachineType:L2Cache, "Token protocol")
           TBE ptbe := TBEs[in_msg.addr];
           bool mergeable := pending && d_state_merge_limit > 0 && is_valid(ptbe) &&
                             ptbe.DStateHasOp &&
-                            ptbe.DStateOffset == in_msg.DStateOffset &&
-                            ptbe.DStateSize == in_msg.Len &&
+                            ptbe.DStateMerged.masksCompatible(in_msg.DStateMask32, in_msg.DStateMask64) &&
                             ptbe.DStateMerged.count() < d_state_merge_limit;
           // Reject BEFORE acceptance: a NACKed request is consumed here and
           // cannot subsequently reach an application action.
@@ -913,9 +931,9 @@ machine(MachineType:L2Cache, "Token protocol")
               dStateEngine.hasCapacity(d_state_queue_depth) == false ||
               TBEs.areNSlotsAvailable(1, clockEdge()) == false) {
             trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);
-          } else if (in_msg.DStateOffset < 0 ||
+          } else if (scalar_op && (in_msg.DStateOffset < 0 ||
                      in_msg.DStateOffset % in_msg.Len != 0 ||
-                     in_msg.DStateOffset + in_msg.Len > in_msg.DataBlk.getBlockSize()) {
+                     in_msg.DStateOffset + in_msg.Len > in_msg.DataBlk.getBlockSize())) {
             trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);
           } else if (is_invalid(ce) && L2cache.cacheAvail(in_msg.addr) == false) {
             trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);
@@ -1133,6 +1151,26 @@ machine(MachineType:L2Cache, "Token protocol")
     }
     DPRINTF(RubySlicc, "Address: %#x, Data Block: %s\n",
             address, cache_entry.DataBlk);
+  }
+
+  action(d_sendSnapshotToL1GETS, "dsnap", desc="Far read: send the line's data to the L1 without recording a sharer") {
+    assert(is_valid(cache_entry));
+    assert(cache_entry.Sharers.count() == 0);
+    assert(cache_entry.OwnerValid == false);
+    peek(L1requestNetwork_in, RequestMsg) {
+      enqueue(responseNetwork_out, ResponseMsg, cacheResponseLatency()) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_UNCACHED;
+        out_msg.Sender := machineID;
+        out_msg.SenderMachine := MachineType:L2Cache;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.Dirty := false;
+        // Charged as a full data response: the whole line travels, as for an
+        // ordinary GETS. The saving is the absent sharer, not the reply size.
+        out_msg.MessageSize := MessageSizeType:ResponseL2hit_Data;
+      }
+    }
   }
 
   action(d_sendDataToL1GETX, "\d", desc="Send data and a token from TBE to L1 requestor") {
@@ -1824,6 +1862,8 @@ machine(MachineType:L2Cache, "Token protocol")
       tbe.DStateSize := in_msg.Len;
       tbe.DStateOrig := in_msg.Requestor;
       tbe.DStateId := in_msg.DStateId;
+      tbe.DStateMerged.setMasks(in_msg.DStateMask32, in_msg.DStateMask64,
+                                in_msg.DStateOffset, in_msg.Len);
       tbe.DStateHasOp := true;
     }
   }
@@ -1831,10 +1871,20 @@ machine(MachineType:L2Cache, "Token protocol")
     assert(is_valid(tbe));
     assert(tbe.DStateHasOp);
     peek(L1requestNetwork_in, RequestMsg) {
-      assert(in_msg.DStateOffset == tbe.DStateOffset);
-      assert(in_msg.Len == tbe.DStateSize);
-      // operand += incoming delta at the same word, modular at the operand width
-      tbe.DStateOperand.applyDStateAdd(in_msg.DataBlk, tbe.DStateOffset, tbe.DStateSize);
+      // operand += incoming delta, word by word at each word's own width; the
+      // in_port admitted it only if no byte is claimed at two widths
+      assert(tbe.DStateMerged.masksCompatible(in_msg.DStateMask32, in_msg.DStateMask64));
+      if (in_msg.DStateMask32 == 0 && in_msg.DStateMask64 == 0) {
+        tbe.DStateOperand.applyDStateAdd(in_msg.DataBlk, in_msg.DStateOffset, in_msg.Len);
+        if (in_msg.Len == 8) {
+          tbe.DStateMerged.orMasks(0, 1 << (in_msg.DStateOffset / 8));
+        } else {
+          tbe.DStateMerged.orMasks(1 << (in_msg.DStateOffset / 4), 0);
+        }
+      } else {
+        tbe.DStateOperand.applyDStateAddMasked(in_msg.DataBlk, in_msg.DStateMask32, in_msg.DStateMask64);
+        tbe.DStateMerged.orMasks(in_msg.DStateMask32, in_msg.DStateMask64);
+      }
       tbe.DStateMerged.add(in_msg.Requestor, in_msg.DStateId);
     }
   }
@@ -1852,7 +1902,8 @@ machine(MachineType:L2Cache, "Token protocol")
     if (dStateEngine.hotWordHit(address, tbe.DStateOffset)) {
       service := d_state_hit_latency;
     }
-    dStateEngine.hotWordTouch(address, tbe.DStateOffset, d_state_hotwords);
+    dStateEngine.hotWordTouchMask(address, tbe.DStateMerged.mask32(), tbe.DStateMerged.mask64(),
+                                  d_state_hotwords);
     dStateTimer.set(address, start + cyclesToTicks(service));
   }
   action(d_apply, "dapply", desc="Apply ADD once with unsigned 32/64-bit modular arithmetic") {
@@ -1863,7 +1914,8 @@ machine(MachineType:L2Cache, "Token protocol")
     assert(cache_entry.OwnerValid == false);
     assert(dStateEngine.occupancy() > 0);
     assert(dStateTimer.isSet(address));
-    cache_entry.DataBlk.applyDStateAdd(tbe.DStateOperand, tbe.DStateOffset, tbe.DStateSize);
+    cache_entry.DataBlk.applyDStateAddMasked(tbe.DStateOperand, tbe.DStateMerged.mask32(),
+                                             tbe.DStateMerged.mask64());
     cache_entry.Dirty := true;
     if (cache_entry.DStateSeenRequester == false) {
       cache_entry.DStateFirstRequester := tbe.DStateOrig;
@@ -3468,6 +3520,16 @@ machine(MachineType:L2Cache, "Token protocol")
   transition(D, L1_GETS, OLSXS) {
     d_sendDataToL1GETS;
     d_keep;
+    d_recordRead;
+    r_setMRU;
+    uu_profileHit;
+    o_popL1RequestQueue;
+  }
+  // Far read: the line stays retained at the home with no sharer. The next
+  // update therefore applies with no invalidation. A read run that reaches the
+  // downgrade threshold (no update in between) routes to L1_GETS above instead.
+  transition(D, L1_GETS_Far, D) {
+    d_sendSnapshotToL1GETS;
     d_recordRead;
     r_setMRU;
     uu_profileHit;
