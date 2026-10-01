@@ -1,0 +1,108 @@
+# Changes since v1.0.0
+
+v1.0.0 is the artifact archived on Zenodo
+([10.5281/zenodo.22889936](https://doi.org/10.5281/zenodo.22889936)) and described
+by [`paper/MOESI-D Paper.pdf`](../paper/MOESI-D%20Paper.pdf). The PDF is kept
+unchanged because that DOI points to it. This page lists what in it no longer
+holds, what changed in the implementation, and where the current evidence is.
+
+## Corrections to the v1.0.0 paper
+
+1. **Software transparency.** v1.0.0 redirected ordinary x86 `LOCK ADD`. The
+   current revision restores the upstream `LOCK ADD` macro-ops, including flags
+   and every operand width, and exposes the operation only through an explicit
+   no-return, no-flags instruction (`AADD`, `0F 38 FC /r`) used by the benchmarks.
+   No acceleration of unmodified binaries is claimed.
+2. **Early completion.** v1.0.0 completed the issuing atomic as soon as the
+   request left the L1 (the `pendingDStateReqs` description), which allows a
+   younger store to become visible before the add has been applied. That
+   behaviour is withdrawn. The operation now stays outstanding until the update
+   has been applied and acknowledged; see *Completion and ordering* below for
+   how the core avoids stalling on it.
+3. **Operators.** Only 32- and 64-bit modular integer addition is implemented.
+   MIN/MAX/bitwise and floating-point operations described in v1.0.0 are not.
+4. **Directory D state.** D is an L2-local retention policy; the global directory
+   runs the unmodified MOESI_CMP_directory state machine. The directory-level D
+   promotion and forwarding path described in v1.0.0 is not part of this design.
+5. **Random testing.** The stock Ruby random tester used in v1.0.0 does not issue
+   no-return atomics, so it did not exercise the delegated path. Directed CPU
+   workloads with path-coverage checks replace that claim (see
+   [VALIDATION.md](VALIDATION.md)).
+6. **Performance, traffic and energy.** All v1.0.0 speedup, line-migration, byte
+   and energy figures are superseded. They were obtained with early completion,
+   undeclared packet sizes and zero-cost arithmetic at the remote cache. Current
+   same-binary measurements are in
+   [`results/ABLATION_2026-09-30.md`](../results/ABLATION_2026-09-30.md); notably,
+   the single-hot-line and hot-key cases that v1.0.0 led with are slower than the
+   conventional path in this revision.
+7. **Workload scope.** The Count-Min Sketch program measures update aggregation
+   only (no query or error-bound evaluation). Integer SpMV is a negative control,
+   not evidence for general sparse kernels.
+8. **Bibliography.** Several v1.0.0 reference entries carry incorrect or
+   unverified metadata (patent numbers, assignees, venues, years). Consult the
+   primary sources directly; [ARCHITECTURE.md](ARCHITECTURE.md) links the ones
+   this revision relies on.
+
+## Implementation changes
+
+### Completion and ordering
+- The issuing operation completes only on the terminal ACK of an applied update,
+  or after local application on the fallback path. A completion-only sequencer
+  callback cannot apply an update twice.
+- The `AADD` micro-op is store-class: the reorder buffer retires it at commit and
+  the store-queue entry, not the core, waits for the ACK. Under TSO the O3 store
+  queue sends one store at a time, so a later flag store cannot overtake the add.
+  The LSQ never forwards an atomic request's operand to a younger load.
+- `DSTATE_RELAXED_AMO=1` (O3) applies the weaker ordering documented for Intel
+  RAO-INT: no-return adds may overlap one another and later stores; software
+  fences where it publishes.
+
+### Rejection and fallback
+- A bank that cannot accept an update replies with a NACK *before* acceptance.
+  The L1 keeps the operation, consumes the NACK, and retries it through an
+  ordinary exclusive (GETX) acquisition and a local apply. Accepted operations
+  are never NACKed, and invalidation cannot discard a pending delegated request.
+- Owner-plus-sharer states that could expose a stale reader are rejected. The
+  supported retained-read case invalidates every local reader before mutation.
+- `DSTATE_FORCE_NACK=1` rejects every request, as a fallback correctness control.
+
+### Modeled cost and finite resources
+- Explicit home service time (`DSTATE_EXEC_LATENCY`, default 42 cycles) after
+  exclusive acquisition; per-bank admission depth and initiation interval are
+  configuration inputs; L1/L2 TBEs and every endpoint/trigger buffer are finite.
+- Dedicated packet classes with a derived budget: 16 B for a 32-bit update, 24 B
+  for a 64-bit update, 8 B for a terminal ACK/NACK.
+- Bank-side mechanisms, each off by default: a hot-word buffer, same-word
+  combining with one ACK per combined requester, waiting instead of rejecting
+  when the line is busy, and delegation from a read-only L1 copy. See the
+  [configuration table](../README.md#configuration).
+
+### Controls and build
+- Delegation, persistence and forced rejection are independent switches, so the
+  same guest binary runs as the conventional baseline (`DSTATE_ENABLED=0`), home
+  execution, and home execution with retention.
+- Two defects that prevented the protocol from building or from being exercised
+  were fixed: SLICC boolean defaults, and a preprocessor guard that the gem5
+  Kconfig build never defined (which had silently routed every operation down
+  the conventional path). `tools/run_matrix.py` now refuses a passing result
+  unless the mode's required protocol events are nonzero.
+
+### Benchmarks and tooling
+- Per-cell and per-row oracles with nonzero exit codes; checked thread creation
+  and allocation; a race-free read sink.
+- Count-Min Sketch rows use independent seeded mixing; the privatized baseline
+  merges in parallel by cache line.
+- Integer SpMV accepts only integer/pattern Matrix Market input and rejects
+  malformed, truncated or fractional files.
+- `tools/export_patch.py` regenerates the three patch views deterministically from
+  the canonical sources; `tests/check_artifact.py` checks they agree.
+- `tools/run_matrix.py` records commands, environment, simulator/guest/patch
+  hashes, configuration, statistics and guest output for every run;
+  `tools/ablate.sh` reproduces every table in `results/`.
+
+## Open
+
+Deadlock freedom with finite queues is argued, not proven; full-system execution,
+device DMA, fault/interrupt ordering, larger core counts and mesh topologies,
+ROI-scoped and repeated measurements, application-level benefit, and any power,
+area or RTL evaluation remain to be done. See ARCHITECTURE.md §5.

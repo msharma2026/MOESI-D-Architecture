@@ -1,0 +1,537 @@
+diff --git a/src/cpu/minor/lsq.cc b/src/cpu/minor/lsq.cc
+index 4b31b26..6e65106 100644
+--- a/src/cpu/minor/lsq.cc
++++ b/src/cpu/minor/lsq.cc
+@@ -1593,7 +1593,8 @@ LSQ::pushRequest(MinorDynInstPtr inst, bool isLoad, uint8_t *data,
+ 
+     bool needs_burst = transferNeedsBurst(addr, size, lineWidth);
+ 
+-    if (needs_burst && inst->staticInst->isAtomic()) {
++    // A store-class no-return atomic (functor present) is still an AMO here.
++    if (needs_burst && (inst->staticInst->isAtomic() || amo_op)) {
+         // AMO requests that access across a cache line boundary are not
+         // allowed since the cache does not guarantee AMO ops to be executed
+         // atomically in two cache lines
+@@ -1619,7 +1620,7 @@ LSQ::pushRequest(MinorDynInstPtr inst, bool isLoad, uint8_t *data,
+         /* Request_data becomes the property of a ...DataRequest (see below)
+          *  and destroyed by its destructor */
+         request_data = new uint8_t[size];
+-        if (inst->staticInst->isAtomic() ||
++        if (inst->staticInst->isAtomic() || amo_op ||
+             (flags & Request::STORE_NO_DATA)) {
+             /* For atomic or store-no-data, just use zeroed data */
+             std::memset(request_data, 0, size);
+diff --git a/src/cpu/o3/BaseO3CPU.py b/src/cpu/o3/BaseO3CPU.py
+index 3c477c1..f535668 100644
+--- a/src/cpu/o3/BaseO3CPU.py
++++ b/src/cpu/o3/BaseO3CPU.py
+@@ -206,6 +206,11 @@ class BaseO3CPU(BaseCPU):
+         "Branch Predictor",
+     )
+     needsTSO = Param.Bool(False, "Enable TSO Memory model")
++    relaxedNoReturnAtomics = Param.Bool(
++        False,
++        "No-return atomic stores bypass TSO store ordering (weakly ordered, "
++        "RAO-INT style); software fences where it publishes",
++    )
+ 
+     recvRespThrottling = Param.Bool(
+         False, "Enable load receive response throttling in the LSQ"
+diff --git a/src/cpu/o3/lsq_unit.cc b/src/cpu/o3/lsq_unit.cc
+index 67ae692..b3c1329 100644
+--- a/src/cpu/o3/lsq_unit.cc
++++ b/src/cpu/o3/lsq_unit.cc
+@@ -216,6 +216,7 @@ LSQUnit::init(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params,
+     depCheckShift = params.LSQDepCheckShift;
+     checkLoads = params.LSQCheckLoads;
+     needsTSO = params.needsTSO;
++    relaxedNoReturnAtomics = params.relaxedNoReturnAtomics;
+ 
+     resetState();
+ }
+@@ -816,11 +817,13 @@ LSQUnit::writebackStores()
+         writebackBlockedStore();
+     }
+ 
++    // Relaxed no-return atomics (RAO-INT style) neither wait for nor block
++    // TSO's single in-flight store; ordinary stores keep the rule.
+     while (storesToWB > 0 &&
+            storeWBIt.dereferenceable() &&
+            storeWBIt->valid() &&
+            storeWBIt->canWB() &&
+-           ((!needsTSO) || (!storeInFlight)) &&
++           ((!needsTSO) || (!storeInFlight) || relaxedStore(*storeWBIt)) &&
+            lsq->cachePortAvailable(false)) {
+ 
+         if (isStoreBlocked) {
+@@ -1089,7 +1092,7 @@ LSQUnit::storePostSend()
+         }
+     }
+ 
+-    if (needsTSO) {
++    if (needsTSO && !relaxedStore(*storeWBIt)) {
+         storeInFlight = true;
+     }
+ 
+@@ -1162,6 +1165,8 @@ void
+ LSQUnit::completeStore(typename StoreQueue::iterator store_idx)
+ {
+     assert(store_idx->valid());
++    // A relaxed no-return atomic never owned the TSO in-flight slot.
++    const bool relaxed_store = relaxedStore(*store_idx);
+     store_idx->completed() = true;
+     --storesToWB;
+     // A bit conservative because a store completion may not free up entries,
+@@ -1203,7 +1208,7 @@ LSQUnit::completeStore(typename StoreQueue::iterator store_idx)
+ 
+     store_inst->setCompleted();
+ 
+-    if (needsTSO) {
++    if (needsTSO && !relaxed_store) {
+         storeInFlight = false;
+     }
+ 
+@@ -1442,7 +1447,12 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
+             // data), the store has all of the data needed, and
+             // the load is not LLSC, then
+             // we can forward data from the store to the load
+-            if (!store_it->instruction()->isAtomic() &&
++            // A store-class no-return atomic carries an operand, not data: never
++            // forward it (the instruction flag alone would say it is a store).
++            bool store_is_atomic = store_it->instruction()->isAtomic() ||
++                (store_it->hasRequest() &&
++                 store_it->request()->mainReq()->isAtomic());
++            if (!store_is_atomic &&
+                 store_has_lower_limit && store_has_upper_limit &&
+                 !request->mainReq()->isLLSC()) {
+ 
+@@ -1464,7 +1474,7 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
+                   (store_has_upper_limit || lower_load_has_store_part))) ||
+                 // The store entry is atomic and has all or part of the load's
+                 // data
+-                (store_it->instruction()->isAtomic() &&
++                (store_is_atomic &&
+                  ((store_has_lower_limit || upper_load_has_store_part) &&
+                   (store_has_upper_limit || lower_load_has_store_part)))) {
+ 
+diff --git a/src/cpu/o3/lsq_unit.hh b/src/cpu/o3/lsq_unit.hh
+index 40003ce..1885ae6 100644
+--- a/src/cpu/o3/lsq_unit.hh
++++ b/src/cpu/o3/lsq_unit.hh
+@@ -519,6 +519,17 @@ class LSQUnit
+     /** Flag for memory model. */
+     bool needsTSO;
+ 
++    /** No-return atomics bypass TSO store ordering (weakly ordered). */
++    bool relaxedNoReturnAtomics;
++
++    /** A no-return atomic store that neither waits for nor holds the TSO
++     *  in-flight store slot (Intel RAO-INT style weak ordering). */
++    bool relaxedStore(SQEntry &e)
++    {
++        return relaxedNoReturnAtomics && e.hasRequest() &&
++               e.request()->mainReq()->isAtomicNoReturn();
++    }
++
+   protected:
+     // Will also need how many read/write ports the Dcache has.  Or keep track
+     // of that in stage that is one level up, and only call executeLoad/Store
+diff --git a/src/mem/ruby/SConscript b/src/mem/ruby/SConscript
+index ea97d72..698427a 100644
+--- a/src/mem/ruby/SConscript
++++ b/src/mem/ruby/SConscript
+@@ -109,6 +109,8 @@ MakeInclude('common/WriteMask.hh')
+ MakeInclude('network/MessageBuffer.hh')
+ MakeInclude('structures/CacheMemory.hh')
+ MakeInclude('structures/DirectoryMemory.hh')
++MakeInclude('structures/DStateEngine.hh')
++MakeInclude('structures/DStateMergeSet.hh')
+ MakeInclude('structures/PerfectCacheMemory.hh')
+ MakeInclude('structures/PersistentTable.hh')
+ MakeInclude('structures/RubyPrefetcher.hh')
+@@ -117,6 +119,10 @@ MakeInclude('structures/TBEStorage.hh')
+ if env['CONF']['RUBY_PROTOCOL_CHI']:
+     MakeInclude('structures/MN_TBEStorage.hh')
+     MakeInclude('structures/MN_TBETable.hh')
++# MOESI_D: make the protocol macro visible to C++ (Sequencer atomic routing).
++# Kconfig builds define no generic PROTOCOL_<name>; mirror the CHI pattern above.
++if env['CONF'].get('RUBY_PROTOCOL_MOESI_D'):
++    env.Append(CPPDEFINES=['PROTOCOL_MOESI_D'])
+ MakeInclude('structures/TBETable.hh')
+ MakeInclude('structures/TimerTable.hh')
+ MakeInclude('structures/WireBuffer.hh')
+diff --git a/src/mem/ruby/common/DataBlock.hh b/src/mem/ruby/common/DataBlock.hh
+index ebfa7d1..7d7a5b5 100644
+--- a/src/mem/ruby/common/DataBlock.hh
++++ b/src/mem/ruby/common/DataBlock.hh
+@@ -49,6 +49,7 @@
+ #include <iostream>
+ 
+ #include "mem/packet.hh"
++#include "mem/ruby/structures/DStateEngine.hh"
+ 
+ namespace gem5
+ {
+@@ -98,6 +99,7 @@ class DataBlock
+     void clearAtomicLogEntries();
+     uint8_t *getDataMod(int offset);
+     void setByte(int whichByte, uint8_t data);
++    void applyDStateAdd(const DataBlock &operand, int offset, int size);
+     void setData(const uint8_t *data, int offset, int len);
+     void setData(PacketPtr pkt);
+     void copyPartial(const DataBlock &dblk, int offset, int len);
+@@ -147,6 +149,17 @@ DataBlock::setByte(int whichByte, uint8_t data)
+     m_data[whichByte] = data;
+ }
+ 
++inline void
++DataBlock::applyDStateAdd(const DataBlock &operand, int offset, int size)
++{
++    assert(m_alloc && operand.m_alloc);
++    assert((size == 4 || size == 8) && offset >= 0 && offset % size == 0);
++    assert(offset + size <= m_block_size && offset + size <= operand.m_block_size);
++    // Explicit little-endian transport and unsigned modular arithmetic avoid
++    // host alignment, byte-order and signed-overflow dependencies.
++    dstateAdd(m_data, operand.m_data, m_block_size, offset, size);
++}
++
+ inline void
+ DataBlock::copyPartial(const DataBlock & dblk, int offset, int len)
+ {
+diff --git a/src/mem/ruby/network/Network.cc b/src/mem/ruby/network/Network.cc
+index 480b5bc..1976d9c 100644
+--- a/src/mem/ruby/network/Network.cc
++++ b/src/mem/ruby/network/Network.cc
+@@ -166,6 +166,12 @@ uint32_t
+ Network::MessageSizeType_to_int(MessageSizeType size_type)
+ {
+     switch(size_type) {
++      case MessageSizeType_DState_Update:
++        return 16;
++      case MessageSizeType_DState_Update64:
++        return 24;
++      case MessageSizeType_DState_Response:
++        return 8;
+       case MessageSizeType_Control:
+       case MessageSizeType_Request_Control:
+       case MessageSizeType_Reissue_Control:
+diff --git a/src/mem/ruby/protocol/Kconfig b/src/mem/ruby/protocol/Kconfig
+index 5b584fb..b53aa87 100644
+--- a/src/mem/ruby/protocol/Kconfig
++++ b/src/mem/ruby/protocol/Kconfig
+@@ -43,6 +43,10 @@ config RUBY_PROTOCOL_MESI_Three_Level_HTM
+ config RUBY_PROTOCOL_MI_example
+     bool "MI example"
+     default n
++config RUBY_PROTOCOL_MOESI_D
++    bool "MOESI D-state (Delegated reduction protocol)"
++    default n
++
+ config RUBY_PROTOCOL_MOESI_CMP_directory
+     bool "MOESI CMP directory"
+     default n
+diff --git a/src/mem/ruby/protocol/RubySlicc_Exports.sm b/src/mem/ruby/protocol/RubySlicc_Exports.sm
+index 33c1b55..d3f9dea 100644
+--- a/src/mem/ruby/protocol/RubySlicc_Exports.sm
++++ b/src/mem/ruby/protocol/RubySlicc_Exports.sm
+@@ -78,11 +78,13 @@ structure(WriteMask, external="yes", desc="...") {
+ }
+ 
+ structure(DataBlock, external = "yes", desc="..."){
++  int getBlockSize();
+   void clear();
+   void copyPartial(DataBlock, int, int);
+   void copyPartial(DataBlock, WriteMask);
+   void atomicPartial(DataBlock, WriteMask);
+   void atomicPartial(DataBlock, WriteMask, bool);
++  void applyDStateAdd(DataBlock, int, int);
+   int numAtomicLogEntries();
+   void clearAtomicLogEntries();
+ }
+@@ -290,6 +292,14 @@ enumeration(MachineType, desc="...", default="MachineType_NULL") {
+ 
+ // MessageSizeType
+ enumeration(MessageSizeType, desc="...") {
++  // Delegated-update payload budget (128 B lines, 48-bit PA, <=64 requesters):
++  //   line address 41b + word offset 5b + size 1b + op 2b + requester 6b + tag 8b
++  //   = 63b header; + 32b operand = 95b -> 16 B; + 64b operand = 127b -> 24 B.
++  //   The terminal response needs only tag 8b + requester 6b + status 2b -> 8 B;
++  //   the requester keys on the tag, so no address travels back.
++  DState_Update, desc="16-byte 32-bit update: 63-bit header + 32-bit operand";
++  DState_Update64, desc="24-byte 64-bit update: 63-bit header + 64-bit operand";
++  DState_Response, desc="8-byte terminal ACK/NACK: tag, requester, status";
+   Control,    desc="Control Message";
+   Data,       desc="Data Message";
+   Request_Control, desc="Request";
+diff --git a/src/mem/ruby/protocol/RubySlicc_Types.sm b/src/mem/ruby/protocol/RubySlicc_Types.sm
+index 848d164..b19589a 100644
+--- a/src/mem/ruby/protocol/RubySlicc_Types.sm
++++ b/src/mem/ruby/protocol/RubySlicc_Types.sm
+@@ -139,6 +139,7 @@ structure (Sequencer, external = "yes") {
+                      Cycles, Cycles, Cycles);
+   void writeUniqueCallback(Addr, DataBlock);
+ 
++  void atomicRemoteCallback(Addr);
+   void atomicCallback(Addr, DataBlock);
+   void atomicCallback(Addr, DataBlock, bool);
+   void atomicCallback(Addr, DataBlock, bool, MachineType);
+diff --git a/src/mem/ruby/structures/DStateEngine.hh b/src/mem/ruby/structures/DStateEngine.hh
+new file mode 100644
+index 0000000..dd1f84a
+--- /dev/null
++++ b/src/mem/ruby/structures/DStateEngine.hh
+@@ -0,0 +1,111 @@
++// SPDX-License-Identifier: BSD-3-Clause
++// Finite-capacity bank executor reference model, not a synthesized datapath.
++// Capacity, initiation interval, service latencies and the hot-word buffer are
++// configuration inputs for sensitivity studies; the defaults selected in
++// MOESI_D.py reproduce a single non-pipelined accepted operation per bank with a
++// flat service time. Compiles standalone (tests/dstate_unit.cc); the merge set
++// for combining lives in DStateMergeSet.hh because it needs MachineID.
++#ifndef MOESI_D_ENGINE_HH
++#define MOESI_D_ENGINE_HH
++
++#include <algorithm>
++#include <cassert>
++#include <cstdint>
++#include <limits>
++#include <ostream>
++#include <utility>
++#include <vector>
++
++namespace gem5::ruby
++{
++// Shared by DataBlock and the standalone datapath boundary tests.
++inline void dstateAdd(std::uint8_t *data, const std::uint8_t *operand,
++                      int blockSize, int offset, int size)
++{
++    assert(data && operand);
++    assert((size == 4 || size == 8) && offset >= 0 && offset % size == 0);
++    assert(size <= blockSize && offset <= blockSize - size);
++    std::uint64_t value = 0, delta = 0;
++    for (int byte = 0; byte < size; ++byte) {
++        value |= std::uint64_t(data[offset + byte]) << (8 * byte);
++        delta |= std::uint64_t(operand[offset + byte]) << (8 * byte);
++    }
++    value += delta;
++    for (int byte = 0; byte < size; ++byte)
++        data[offset + byte] = std::uint8_t(value >> (8 * byte));
++}
++
++class DStateEngine
++{
++  public:
++    // Admission: at most `capacity` accepted operations in flight per bank.
++    bool hasCapacity(int capacity) const { return inflight < capacity; }
++    int occupancy() const { return inflight; }
++    void reserve() { ++inflight; }
++    void release() { assert(inflight > 0); --inflight; }
++
++    // Issue timing: operation k+1 may start no earlier than start_k + interval.
++    // interval == service latency gives the non-pipelined model; a shorter
++    // interval models a pipelined datapath whose latency stays at the service
++    // time. Returns the start tick for the caller to add its latency to.
++    std::uint64_t scheduleStart(std::uint64_t now, std::uint64_t interval)
++    {
++        const std::uint64_t start = std::max(now, nextStart);
++        nextStart = start + interval;
++        return start;
++    }
++
++    // Hot-word buffer: a small LRU set of (line, word offset) pairs whose latest
++    // value is modelled as living in registers at the bank rather than in the
++    // SRAM array, like a write-combining buffer. A hit charges the hit latency;
++    // a miss charges the full service latency. Purely a timing model: the
++    // DataBlock always holds the authoritative value. Capacity 0 disables it.
++    bool hotWordHit(std::uint64_t line, int offset) const
++    {
++        for (const auto &w : hotWords)
++            if (w.first == line && w.second == offset) return true;
++        return false;
++    }
++    void hotWordTouch(std::uint64_t line, int offset, int capacity)
++    {
++        if (capacity <= 0) { hotWords.clear(); return; }
++        const std::pair<std::uint64_t, int> key(line, offset);
++        auto it = std::find(hotWords.begin(), hotWords.end(), key);
++        if (it != hotWords.end()) hotWords.erase(it);
++        hotWords.insert(hotWords.begin(), key);
++        while (static_cast<int>(hotWords.size()) > capacity) hotWords.pop_back();
++    }
++    // The line left this bank (eviction, ownership transfer): its words can no
++    // longer be register-resident here.
++    void hotWordDrop(std::uint64_t line)
++    {
++        hotWords.erase(std::remove_if(hotWords.begin(), hotWords.end(),
++                                      [line](const auto &w) { return w.first == line; }),
++                       hotWords.end());
++    }
++
++    std::uint64_t nextId()
++    {
++        assert(sequence != std::numeric_limits<std::uint64_t>::max());
++        return ++sequence;
++    }
++    void print(std::ostream &out) const
++    {
++        out << "DStateEngine(inflight=" << inflight
++            << " nextStart=" << nextStart
++            << " hotWords=" << hotWords.size() << ")";
++    }
++
++  private:
++    int inflight = 0;
++    std::uint64_t nextStart = 0;
++    std::uint64_t sequence = 0;
++    std::vector<std::pair<std::uint64_t, int>> hotWords;
++};
++inline std::ostream &operator<<(std::ostream &out, const DStateEngine &engine)
++{
++    engine.print(out);
++    return out;
++}
++} // namespace gem5::ruby
++#endif
+diff --git a/src/mem/ruby/structures/DStateMergeSet.hh b/src/mem/ruby/structures/DStateMergeSet.hh
+new file mode 100644
+index 0000000..f5c0388
+--- /dev/null
++++ b/src/mem/ruby/structures/DStateMergeSet.hh
+@@ -0,0 +1,41 @@
++// SPDX-License-Identifier: BSD-3-Clause
++// Requesters whose same-word update was folded into an already-accepted
++// operation (combining). Each still receives exactly one terminal ACK carrying
++// its own transaction ID; the merged operand is applied once. Bounded by the
++// controller's merge limit; the L2 TBE owns one of these. Kept separate from
++// DStateEngine.hh because it needs MachineID, which the standalone unit test
++// does not have.
++#ifndef MOESI_D_MERGE_SET_HH
++#define MOESI_D_MERGE_SET_HH
++
++#include <cassert>
++#include <cstdint>
++#include <ostream>
++#include <utility>
++#include <vector>
++
++#include "mem/ruby/common/MachineID.hh"
++
++namespace gem5::ruby
++{
++class DStateMergeSet
++{
++  public:
++    void add(MachineID requester, std::uint64_t id) { entries.emplace_back(requester, id); }
++    int count() const { return static_cast<int>(entries.size()); }
++    MachineID requester(int i) const { assert(i >= 0 && i < count()); return entries[i].first; }
++    std::uint64_t id(int i) const { assert(i >= 0 && i < count()); return entries[i].second; }
++    void popBack() { assert(!entries.empty()); entries.pop_back(); }
++    void clear() { entries.clear(); }
++    void print(std::ostream &out) const { out << "DStateMergeSet(n=" << entries.size() << ")"; }
++
++  private:
++    std::vector<std::pair<MachineID, std::uint64_t>> entries;
++};
++inline std::ostream &operator<<(std::ostream &out, const DStateMergeSet &set)
++{
++    set.print(out);
++    return out;
++}
++} // namespace gem5::ruby
++#endif
+diff --git a/src/mem/ruby/system/Sequencer.cc b/src/mem/ruby/system/Sequencer.cc
+index ec9b417..4767795 100644
+--- a/src/mem/ruby/system/Sequencer.cc
++++ b/src/mem/ruby/system/Sequencer.cc
+@@ -42,6 +42,7 @@
+ #include "mem/ruby/system/Sequencer.hh"
+ 
+ #include "base/logging.hh"
++#include "base/amo.hh"
+ #include "cpu/testers/rubytest/RubyTester.hh"
+ #include "debug/LLSC.hh"
+ #include "debug/ProtocolTrace.hh"
+@@ -695,6 +696,36 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
+     }
+ }
+ 
++void
++Sequencer::atomicRemoteCallback(Addr address)
++{
++    // Completion only: the home controller already applied the operation.
++    // Calling hitCallback here would execute its functor a second time.
++    auto it = m_RequestTable.find(address);
++    panic_if(it == m_RequestTable.end() || it->second.empty(),
++             "Delegated atomic completed without an outstanding request");
++    auto &requests = it->second;
++    auto &request = requests.front();
++    panic_if(request.m_type != RubyRequestType_ATOMIC_NO_RETURN,
++             "Remote completion is only valid for a no-return atomic");
++    panic_if(m_usingRubyTester || m_ruby_system->getWarmupEnabled() ||
++             m_ruby_system->getCooldownEnabled(),
++             "MOESI-D remote completion requires the supported timing-CPU mode");
++    PacketPtr pkt = request.pkt;
++    recordMissLatency(&request, true, MachineType_NUM, true,
++                      Cycles(0), Cycles(0), Cycles(0));
++    llscClearMonitor(address);
++    markRemoved();
++    requests.pop_front();
++    if (requests.empty()) {
++        m_RequestTable.erase(it);
++    } else {
++        issueRequest(requests.front().pkt, requests.front().m_second_type);
++    }
++    ruby_hit_callback(pkt);
++    testDrainComplete();
++}
++
+ void
+ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
+                        bool llscSuccess,
+@@ -1009,7 +1040,7 @@ Sequencer::makeRequest(PacketPtr pkt)
+     } else if (pkt->req->isTlbiCmd()) {
+         primary_type = secondary_type = tlbiCmdToRubyRequestType(pkt);
+         DPRINTF(RubySequencer, "Issuing TLBI\n");
+-#if defined (PROTOCOL_CHI)
++#if defined(PROTOCOL_CHI) || defined(PROTOCOL_MOESI_D)
+     } else if (pkt->isAtomicOp()) {
+         if (pkt->req->isAtomicReturn()){
+             DPRINTF(RubySequencer, "Issuing ATOMIC RETURN \n");
+@@ -1152,6 +1183,24 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
+                                 (offset, pkt->getAtomicOp()));
+ 
+             msg->setWriteMask(offset, pkt->getSize(), atomicOps);
++
++#if defined(PROTOCOL_MOESI_D)
++            // Transport only a known ADD operand. Do not run an arbitrary
++            // functor on zero: that is not a valid encoding of AND/MIN/etc.
++            if (secondary_type == RubyRequestType_ATOMIC_NO_RETURN) {
++                auto *add32 = dynamic_cast<AtomicOpAdd<uint32_t> *>(pkt->getAtomicOp());
++                auto *add64 = dynamic_cast<AtomicOpAdd<uint64_t> *>(pkt->getAtomicOp());
++                const int size = pkt->getSize();
++                panic_if(!((size == 4 && add32) || (size == 8 && add64)) ||
++                         offset % size || offset + size > blk_size,
++                         "MOESI-D supports only aligned ADD32/ADD64 timing requests");
++                uint64_t operand = size == 4 ? uint64_t(add32->a) : add64->a;
++                uint8_t encoded[8] = {};
++                for (int byte = 0; byte < size; ++byte)
++                    encoded[byte] = uint8_t(operand >> (8 * byte));
++                msg->m_WTData.setData(encoded, offset, size);
++            }
++#endif
+         }
+ 
+         DPRINTFR(ProtocolTrace, "%15s %3s %10s%20s %6s>%-6s %#x %s\n",
+diff --git a/src/mem/ruby/system/Sequencer.hh b/src/mem/ruby/system/Sequencer.hh
+index f530eb4..f2375bb 100644
+--- a/src/mem/ruby/system/Sequencer.hh
++++ b/src/mem/ruby/system/Sequencer.hh
+@@ -125,6 +125,8 @@ class Sequencer : public RubyPort
+                       const Cycles forwardRequestTime = Cycles(0),
+                       const Cycles firstResponseTime = Cycles(0));
+ 
++    void atomicRemoteCallback(Addr address);
++
+     void atomicCallback(Addr address,
+                         DataBlock& data,
+                         const bool externalHit = false,

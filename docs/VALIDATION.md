@@ -1,0 +1,112 @@
+# Validation actually performed
+
+Two records. The first is the 2026-09-29 source-level validation of the corrected
+branch (macOS, no simulator build). The second is the 2026-09-30 build-and-run
+validation that followed it, which found two build-blocking defects the first
+record could not see, fixed them, and produced the first measurements of the
+corrected protocol. Numbers live in [`results/ABLATION_2026-09-30.md`](../results/ABLATION_2026-09-30.md).
+
+## 2026-09-30: full build, directed execution, ablation
+
+Host: WSL2 Ubuntu 24.04, gcc 13.3.0, Python 3.12.3, 24 cores / 19 GB. gem5 base
+v25.1.0.1 (`c8222cc`) in a detached worktree with the complete patch applied.
+Build: `scons build/X86_MOESI_D/gem5.opt -j10`, about 11 minutes from clean,
+918 MB binary. Guest binaries built with the repository Makefile (gcc 13, static,
+`-fopenmp -pthread`).
+
+### Two defects that only a build could find
+
+| Defect | Symptom | Fix |
+|---|---|---|
+| SLICC `bool` parameter defaults written as `true`/`false` in the L1 and L2 machines | SLICC copies the default verbatim into the generated Python SimObject; scons aborts (SIGABRT 134) at a `[SO Param]` step with `NameError: name 'true' is not defined`. Standalone SLICC generation passes. | `:= "True"` / `:= "False"`, as stock protocols write them |
+| `#if defined(PROTOCOL_MOESI_D)` around the Sequencer's atomic classification, but gem5's Kconfig build defines no generic `PROTOCOL_<name>` macro (only `PROTOCOL_CHI`) | The branch compiled out. Every AADD reached Ruby as an ordinary store; the functor was applied at the requester by `hitCallback`; **every oracle passed while no delegated event ever fired.** | `env.Append(CPPDEFINES=['PROTOCOL_MOESI_D'])` in `src/mem/ruby/SConscript`, mirroring the CHI block |
+
+Both are now guarded: `tests/check_artifact.py` asserts the SConscript define is
+in the patch, and `tools/run_matrix.py` refuses to accept a run whose mode did
+not produce its required events (`COVERAGE` table), so a silently conventional
+run can no longer pass. Decisive post-build check:
+`strings build/X86_MOESI_D/gem5.opt | grep -c 'Issuing ATOMIC NO RETURN'` must be 1.
+
+### Passed
+
+| Check | Result and scope |
+|---|---|
+| `git apply --check --whitespace=error-all` to a pristine `c8222cc` worktree | Clean, after normalizing two CRLF canonical files that a Windows checkout had produced (`*.h`, `*.mtx` now pinned in `.gitattributes`) |
+| `tests/check_artifact.py` | 6/6, including the new protocol-macro guard; passes on Windows and Linux (`export_patch.py` path bug fixed) |
+| SLICC and x86 ISA generation from the patched worktree | Pass; `dstateBaseStalls` and 59 `DState_Busy` transitions present in generated C++ |
+| `tests/run_native.py`, `tests/dstate_unit.cc` | Pass on Linux (previously only macOS) |
+| `coherence_regression` under `run_matrix.py`, 5 CPUs, all four modes, **coverage gate on** | O3 fenced/default, O3 unfenced/default, O3 unfenced with queue-8 / interval-4 / busy-stall, Minor fenced/default: 16/16 modes CORRECT with the required delegated, local, reject and retry events all nonzero |
+| `ordering_litmus`, 2 CPUs, O3, 20,000 rounds × 2 variants | Unfenced/default, fenced/default, unfenced/knobs: 59,998 delegated completions each, **0 forbidden observations, 0 lost updates**. Stock `lock addl` and local-placement controls: conventional path, 0 forbidden |
+| v1.0.0-style tree (early completion) as negative control | 5,000 rounds × 2, 14,998 delegated, 0 forbidden. Inconclusive by design: a deterministic 2-core crossbar never opened the window. Only a FAIL would have been evidence |
+| `scatter`, `scatter_rw`, `scatter_multi` (512 lines) under `run_matrix.py`, O3, Garnet crossbar, 4 banks | Every configuration × mode CORRECT with coverage; see the results file |
+
+### Round 2 (second build of the same day, 16:19): five more mechanisms
+
+Store-class AADD micro-op (`IsStore`, ROB retires at commit, the store-queue entry
+holds the ACK), hot-word buffer, same-word combining, relaxed no-return ordering
+(`DSTATE_RELAXED_AMO`, O3), and delegate-from-S. Same worktree and base commit;
+`export_patch.py` re-run after the build left every canonical file in the
+worktree byte-identical (md5 of the mirrored set unchanged), so the patches in
+this repository are what was measured.
+
+Two more defects that only execution found:
+
+| Defect | Symptom | Fix |
+|---|---|---|
+| Minor CPU LSQ copies store data for every store-class request; the store-class atomic carries a functor, not data | `X86MinorCPU` segfault (rc −11) on the first AADD, O3 unaffected | `src/cpu/minor/lsq.cc`: treat `isAtomic()` and the AMO functor alike (no data copy), mirroring the O3 forwarding guard |
+| First delegate-from-S design dropped the S copy silently and went to `D_REQ`; the L2 still believed the L1 held S and forwarded `Fwd_GETS`/`Inv` to it | `Invalid transition event: Ack state: IS` in `coherence_regression` | Two new L1 states `D_REQ_S`/`D_RETRY_S` that keep the duties of S (serve `Fwd_GETS`/`Fwd_DMA`, ACK `Fwd_GETX`, drop to `D_REQ`/`D_RETRY` on `Inv`) until the ACK or the fallback |
+
+Passed after the fixes (every mode CORRECT **and** through the coverage gate):
+
+| Check | Result |
+|---|---|
+| `coherence_regression`, 5 CPUs: O3 hot+merge, Minor hot+merge, O3 from-S, O3 relaxed | 16/16 modes, required delegated / local / reject / retry / merge events nonzero; the from-S run shows `DStateReq_CPU_S` and `D_REQ_S` transitions |
+| `ordering_litmus`, 2 CPUs, 20,000 × 2: hot+merge, from-S, fenced+relaxed | 0 forbidden, 0 lost, 59,998 delegated each. Unfenced+relaxed (L7) also 0 forbidden, but that row is a contract check only: the relaxed knob *permits* the reorder and a deterministic 2-core crossbar did not produce it |
+| `scatter` ×5, `scatter_rw` ×5, `scatter_multi` 512 ×5, hot-key ×6, 800k-add `long` ×9 | every configuration × mode CORRECT with coverage; numbers in the results file |
+| `tests/check_artifact.py` 7/7 (adds the forwarding-guard and macro tests); `tests/dstate_unit.cc` (admission, interval, hot-word LRU/drop, merged arithmetic) | pass |
+
+### Measurement caveats that apply to every number
+
+- **Whole-program `simSeconds`, no ROI.** `libm5` was not built, so times include
+  OpenMP runtime start-up and the serial oracle. Comparisons *between modes of the
+  same binary* are meaningful (identical fixed cost); absolute speedups are diluted.
+  On `scatter` (8,000 adds) the fixed cost dominates and ±1% differences are noise;
+  on `scatter_multi` (4.1M adds) it does not.
+- Deterministic single runs, fixed seeds. No confidence intervals are claimed.
+- Executor depth/interval/latency values other than the defaults are sensitivity
+  points, not a measured datapath.
+- Flit counts are a traffic proxy, not energy.
+
+### Not performed / not claimed
+
+- `gem5.debug` build; fault/interrupt ordering on either CPU.
+- A non-deterministic or larger-window litmus for the relaxed knob: L7 shows only that
+  this simulator did not reorder, not that it cannot; the contract says it may.
+- Model checking, saturation to buffer overflow, deadlock/starvation proof.
+- 8,192-line and larger working sets; bank/core sweeps; mesh topology; tail latency.
+- ROI-scoped timing, repeats with varied seeds, energy, RTL/PPA.
+
+## 2026-09-29: source-level validation (historical)
+
+Date: 2026-09-29. Host: macOS arm64, Apple Clang 17.0.0, Python 3.14.7.
+gem5 base: v25.1.0.1, commit `c8222cc67a399bfc01e8658dd14b30d5bfd634f9`.
+Python generation environment: `ply 3.11`, `PyYAML 6.0.3`.
+
+| Check | Result and scope |
+|---|---|
+| `git apply --check --whitespace=error-all` and actual apply to a fresh pinned gem5 worktree | Complete patch applies cleanly, including new headers, protocol files, configs, fixtures and benchmark Makefile |
+| SLICC generation, MOESI_D | Pass, including final D_RETRY/backpressure fix; repeated from fresh patched worktree |
+| SLICC generation, base MOESI_CMP_directory in integrated tree | Pass; generic Ruby integration additions do not prevent base source generation |
+| x86 ISA generation | Pass; stock macros plus explicit AADD-subset decoding/micro-ops generate |
+| x86-64 object compilation of `coherence_regression.c` | Pass with Clang; validates inline-assembly constraints/encoding assembly, not execution in gem5 |
+| `python3 tests/check_artifact.py` | Five checks pass: complete-patch mirror equality, stock-ISA structural guard, terminal/fallback contract guard, removed ghost/operator definitions, finite-buffer/ablation configuration |
+| `tests/dstate_unit.cc` | Actual helper used by DataBlock passes 32/64-bit wrap and all aligned offsets for 64/128/256-byte lines, neighbor preservation, finite executor reserve/release and ID increment |
+| `python3 tests/run_native.py` pthread cases | Ten host-native workloads pass |
+| Serial-only loader/oracle checks; SpMV malformed-input checks; Python syntax, runner CLI, Makefile dry run, `git diff --check` | Pass |
+
+That record explicitly did not build or execute gem5. The two defects above are
+what that gap concealed; generation success is not a compiler, behavioral or
+formal correctness result.
+
+The historical PDF was left unchanged; its SHA-256 remains
+`a9f7847a1069023896fb4c107aaa1d39a88836931d30499b12da24d410abe9fb`.

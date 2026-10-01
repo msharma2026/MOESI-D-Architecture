@@ -1,0 +1,25 @@
+# Benchmark binaries produced by bench/Makefile
+bench/scatter_dstate
+bench/scatter_base
+bench/scatter_nm
+bench/scatter_base_nm
+bench/scatter_multi
+bench/scatter_multi_base
+bench/scatter_rw
+bench/scatter_rw_base
+bench/spmv_dstate
+bench/spmv_base
+bench/coherence_regression
+bench/litmus_*
+bench/cms_*
+!bench/litmus_bench.c
+!bench/cms_bench.c
+
+# gem5 run output
+m5out/
+*.ini
+*.json
+
+# Python
+__pycache__/
+*.pyc

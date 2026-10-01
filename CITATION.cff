@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "Cite this development branch by repository commit; the listed DOI is the historical v1.0.0 artifact, not this revision."
+title: "MOESI-D: Acknowledged Home-Cache Reductions with Persistent Read Retention"
+abstract: >-
+  Experimental gem5 implementation of explicit no-return ADD32/ADD64 operations
+  executed at the home L2 cache, with acknowledged completion, pre-acceptance
+  NACK with ordinary MOESI fallback, optional bank-side combining, and an
+  optional L2-local read-retention policy. Includes same-binary ablations
+  against the conventional ownership path on a 4-core gem5 model.
+authors:
+  - family-names: Sharma
+    given-names: Manav
+  - family-names: Alkhameri
+    given-names: Yaseen
+version: 1.1.0-dev
+license: BSD-3-Clause
+repository-code: "https://github.com/msharma2026/MOESI-D-Architecture"
+# This branch has not been deposited as a new DOI version.
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.22889935
+    description: Historical project concept DOI; this development branch is not deposited
+  - type: doi
+    value: 10.5281/zenodo.22889936
+    description: Version DOI for the v1.0.0 snapshot
+keywords:
+  - cache coherence
+  - atomic memory operations
+  - hardware delegation
+  - gem5
+  - multi-core architecture
+  - computer architecture

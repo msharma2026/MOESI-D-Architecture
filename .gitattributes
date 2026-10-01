@@ -1,0 +1,25 @@
+# Normalize text by default.
+* text=auto
+
+# Patches must stay byte-exact -- CRLF conversion breaks `git apply`.
+*.patch -text
+
+# gem5 sources are LF; keep them that way on every platform.
+*.sm      text eol=lf
+*.slicc   text eol=lf
+*.isa     text eol=lf
+*.c       text eol=lf
+*.h       text eol=lf
+*.hh      text eol=lf
+*.cc      text eol=lf
+*.py      text eol=lf
+*.sh      text eol=lf
+*.mtx     text eol=lf
+Makefile  text eol=lf
+
+# Binary assets.
+*.pdf binary
+*.png binary
+
+# Unified patches require a single-space context prefix on empty lines.
+*.patch whitespace=-blank-at-eol

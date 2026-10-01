@@ -1,0 +1,186 @@
+diff --git a/src/arch/x86/decoder_tables.cc b/src/arch/x86/decoder_tables.cc
+index 2fba889..10af4b6 100644
+--- a/src/arch/x86/decoder_tables.cc
++++ b/src/arch/x86/decoder_tables.cc
+@@ -164,7 +164,7 @@ namespace X86ISA
+ /*  C */ 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0,
+ /*  D */ 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 1 , 1 , 1 , 1 , 1,
+ /*  E */ 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0,
+-/*  F */ 1 , 1 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0
++/*  F */ 1 , 1 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 0 , 1 , 0 , 0 , 0
+     };
+ 
+     const Decoder::ByteTable Decoder::UsesModRMThreeByte0F3A =
+diff --git a/src/arch/x86/isa/decoder/three_byte_0f38_opcodes.isa b/src/arch/x86/isa/decoder/three_byte_0f38_opcodes.isa
+index ea54e15..1450a34 100644
+--- a/src/arch/x86/isa/decoder/three_byte_0f38_opcodes.isa
++++ b/src/arch/x86/isa/decoder/three_byte_0f38_opcodes.isa
+@@ -163,6 +163,17 @@
+                 0x1C: pabsb_Pq_Qq();
+                 0x1D: pabsw_Pq_Qq();
+                 0x1E: pabsd_Pq_Qq();
++                // Research no-return ADD32/64 subset, not full RAO-INT.
++                0xFC: decode LEGACY_REP {
++                    1: Inst::UD2();
++                    default: decode LEGACY_LOCK {
++                        1: Inst::UD2();
++                        default: decode MODRM_MOD {
++                            3: Inst::UD2();
++                            default: Inst::AADD(Mv, Gv);
++                        }
++                    }
++                }
+                 default: Inst::UD2();
+             }
+         }
+diff --git a/src/arch/x86/isa/includes.isa b/src/arch/x86/isa/includes.isa
+index 9445f20..3cff0a0 100644
+--- a/src/arch/x86/isa/includes.isa
++++ b/src/arch/x86/isa/includes.isa
+@@ -53,6 +53,7 @@ output header {{
+ #include <sstream>
+ 
+ #include "arch/generic/debugfaults.hh"
++#include "base/amo.hh"
+ #include "arch/x86/emulenv.hh"
+ #include "arch/x86/insts/decode_fault.hh"
+ #include "arch/x86/insts/macroop.hh"
+diff --git a/src/arch/x86/isa/insts/general_purpose/arithmetic/add_and_subtract.py b/src/arch/x86/isa/insts/general_purpose/arithmetic/add_and_subtract.py
+index 1e0ead9..04ac6f7 100644
+--- a/src/arch/x86/isa/insts/general_purpose/arithmetic/add_and_subtract.py
++++ b/src/arch/x86/isa/insts/general_purpose/arithmetic/add_and_subtract.py
+@@ -457,3 +457,20 @@ def macroop NEG_LOCKED_P
+     mfence
+ };
+ """
++
++# Experimental no-return ADD subset using the AADD encoding. Unfenced: the
++# store-class micro-op is ordered as a store under TSO (older accesses complete
++# before it is sent; younger stores wait for its acknowledgement), so no mfence
++# is needed for store ordering. Software adds fences where load-after-add
++# ordering is required, as after any store (bench/dstate_ops.h DSTATE_FENCED).
++# No CPUID RAO-INT advertisement; see docs/ARCHITECTURE.md.
++# Standard ADD_LOCKED macros above are intentionally unchanged.
++microcode += """
++def macroop AADD_M_R {
++    stula reg, seg, sib, disp
++};
++def macroop AADD_P_R {
++    rdip t7
++    stula reg, seg, riprel, disp
++};
++"""
+diff --git a/src/arch/x86/isa/microops/ldstop.isa b/src/arch/x86/isa/microops/ldstop.isa
+index 81c13ff..13aebe2 100644
+--- a/src/arch/x86/isa/microops/ldstop.isa
++++ b/src/arch/x86/isa/microops/ldstop.isa
+@@ -225,6 +225,71 @@ def template MicroStoreCompleteAcc {{
+     }
+ }};
+ 
++def template MicroAmoAddExecute {{
++    Fault
++    %(class_name)s::execute(ExecContext *xc,
++            trace::InstRecord *traceData) const
++    {
++        Fault fault = NoFault;
++        Addr EA;
++        %(op_decl)s;
++        %(op_rd)s;
++        %(ea_code)s;
++        %(code)s;
++        DPRINTF(X86, "%s : %s: AMO-add address", instMnem, mnemonic);
++        if (dataSize != 4 && dataSize != 8)
++            return std::make_shared<InvalidOpcode>();
++        if (EA & (dataSize - 1))
++            return std::make_shared<GeneralProtection>(0);
++        if (dataSize == 8) {
++            uint64_t amo_old = 0;
++            fault = xc->amoMem(EA, (uint8_t *)&amo_old, 8, memFlags,
++                        AtomicOpFunctorPtr(new AtomicOpAdd<uint64_t>((uint64_t)Mem)));
++        } else {
++            uint32_t amo_old = 0;
++            fault = xc->amoMem(EA, (uint8_t *)&amo_old, 4, memFlags,
++                        AtomicOpFunctorPtr(new AtomicOpAdd<uint32_t>((uint32_t)Mem)));
++        }
++        return fault;
++    }
++}};
++
++def template MicroAmoAddInitiateAcc {{
++    Fault
++    %(class_name)s::initiateAcc(ExecContext *xc,
++            trace::InstRecord *traceData) const
++    {
++        Fault fault = NoFault;
++        Addr EA;
++        %(op_decl)s;
++        %(op_rd)s;
++        %(ea_code)s;
++        %(code)s;
++        DPRINTF(X86, "%s : %s: AMO-add address", instMnem, mnemonic);
++        if (dataSize != 4 && dataSize != 8)
++            return std::make_shared<InvalidOpcode>();
++        if (EA & (dataSize - 1))
++            return std::make_shared<GeneralProtection>(0);
++        if (dataSize == 8) {
++            fault = xc->initiateMemAMO(EA, 8, memFlags,
++                        AtomicOpFunctorPtr(new AtomicOpAdd<uint64_t>((uint64_t)Mem)));
++        } else {
++            fault = xc->initiateMemAMO(EA, 4, memFlags,
++                        AtomicOpFunctorPtr(new AtomicOpAdd<uint32_t>((uint32_t)Mem)));
++        }
++        return fault;
++    }
++}};
++
++def template MicroAmoAddCompleteAcc {{
++    Fault
++    %(class_name)s::completeAcc(PacketPtr pkt, ExecContext *xc,
++            trace::InstRecord *traceData) const
++    {
++        return NoFault;
++    }
++}};
++
+ def template MicroLdStOpDeclare {{
+     class %(class_name)s : public %(base_class)s
+     {
+@@ -645,6 +710,37 @@ let {{
+     defineMicroStoreOp('Stis', 'Mem = PData;')
+     defineMicroStoreOp('Stul', 'Mem = PData;', mem_flags="Request::LOCKED_RMW")
+ 
++    def defineMicroAmoAddOp(mnemonic, mem_flags="0"):
++        global header_output
++        global decoder_output
++        global exec_output
++        global microopClasses
++        Name = mnemonic
++        name = mnemonic.lower()
++        base = 'X86ISA::LdStOp'
++        iop = InstObjParams(name, Name, base,
++                            { "code": "Mem = PData;",
++                              "ea_code": calculateEA,
++                              "memDataSize": "dataSize" },
++                            ['IsStore', 'IsInteger'])
++        header_output += MicroLdStOpDeclare.subst(iop)
++        exec_output += MicroAmoAddExecute.subst(iop)
++        exec_output += MicroAmoAddInitiateAcc.subst(iop)
++        exec_output += MicroAmoAddCompleteAcc.subst(iop)
++
++        class AmoAddOp(LdStOp):
++            def __init__(self, data, segment, addr, disp=0,
++                    dataSize="env.dataSize", addressSize="env.addressSize",
++                    atCPL0=False, nonSpec=False, uncacheable=False):
++                super().__init__(data, segment, addr, disp,
++                        dataSize, addressSize, mem_flags, atCPL0, False,
++                        nonSpec, uncacheable)
++                self.className = Name
++                self.mnemonic = name
++        microopClasses[name] = AmoAddOp
++
++    defineMicroAmoAddOp('Stula', mem_flags="Request::ATOMIC_NO_RETURN_OP")
++
+     defineMicroStoreOp('Stfp', code='Mem = FpData_uqw;', is_float=True)
+ 
+     defineMicroStoreOp('Stfp87', code='''

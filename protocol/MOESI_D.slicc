@@ -1,0 +1,6 @@
+protocol "MOESI_D";
+include "MOESI_D-msg.sm";
+include "MOESI_D-L1cache.sm";
+include "MOESI_D-L2cache.sm";
+include "MOESI_D-dma.sm";
+include "MOESI_D-dir.sm";
