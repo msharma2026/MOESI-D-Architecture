@@ -33,7 +33,7 @@ KN_FULL="DSTATE_QUEUE_DEPTH=8 DSTATE_INIT_INTERVAL=4 DSTATE_BUSY_STALL=1"
 matrix() { local name=$1 bin=$2 args=$3 cores=$4 cpu=$5; shift 5
   [ -d "$OUT/$name" ] && { echo "$name: exists, skipping"; return; }
   env "$@" python3 "$SRC/tools/run_matrix.py" --gem5-tree "$TREE" --binary "$W/bench/$bin" --workload-args "$args" \
-      --out "$OUT/$name" --cores "$cores" --banks "${BANKS:-4}" --cpu "$cpu" --repeats 1 --timeout "${TIMEOUT:-2400}" --modes "${MODES:-local,remote,persistent,forced-nack}" > "$OUT/$name.log" 2>&1
+      --out "$OUT/$name" --cores "$cores" --banks "${BANKS:-4}" --extra="${EXTRA:-}" --cpu "$cpu" --repeats 1 --timeout "${TIMEOUT:-2400}" --modes "${MODES:-local,remote,persistent,forced-nack}" > "$OUT/$name.log" 2>&1
   printf "%-34s %s/%s modes pass  %s\n" "$name" "$(grep -cE ' PASS$' "$OUT/$name.log")" "$(echo "${MODES:-local,remote,persistent,forced-nack}" | tr ',' '\n' | wc -l)" "$(grep -E ' FAIL' "$OUT/$name.log" | tr '\n' ' ')"; }
 # direct gem5 run for the ordering litmus (prints PASS/FAIL, not CORRECT)
 litmus() { local name=$1 bin=$2; shift 2
@@ -347,6 +347,26 @@ v4)
     done
     wait
     for n in A4_spmv_R4 A5_spmv_T4; do printf "%-34s %s/3 modes pass\n" $n "$(grep -cE ' PASS$' "$OUT/$n.log")"; done ;;
+  tune)
+    # Far-read transitions at low downgrade thresholds (correctness), the promotion
+    # threshold on the read-interleaved line under TSO (far reads did not engage there:
+    # the line rarely reaches D), and a 4x4 mesh instead of the crossbar at 16 cores.
+    matrix F0_regress_T4_down1_o3        coherence_regression        "" 5 X86O3CPU    $KN_T4  DSTATE_READ_DOWNGRADE=1 &
+    matrix F1_regress_R4_fenced_down2_o3 coherence_regression_fenced "" 5 X86O3CPU    $KN_R4  DSTATE_READ_DOWNGRADE=2 &
+    matrix F2_regress_TH4_down1_minor    coherence_regression        "" 5 X86MinorCPU $KN_TH4 DSTATE_READ_DOWNGRADE=1 &
+    MODES=$PERF3 matrix F3_rw800k_T4_thr1 scatter_rw "4 200000 32 8" 4 X86O3CPU $KN_T4 DSTATE_THRESHOLD=1 &
+    wait
+    MODES=$PERF3 matrix F4_rw800k_T4_thr2 scatter_rw "4 200000 32 8" 4 X86O3CPU $KN_T4 DSTATE_THRESHOLD=2 &
+    MODES=$PERF3 matrix F5_rw800k_R4_thr1 scatter_rw "4 200000 32 8" 4 X86O3CPU $KN_R4 DSTATE_THRESHOLD=1 &
+    wait
+    export TIMEOUT=7200
+    BUF16="DSTATE_BUFFER_SIZE=${BUF16:-256}"
+    # Mesh_XY needs the controller count to be a multiple of the router count (16):
+    # 16 L1 + 8 L2 + 8 directories. The crossbar twin with the same counts is the control.
+    MODES=$PERF3 BANKS=8 EXTRA="--num-dirs=8 --topology=Mesh_XY --mesh-rows=4" matrix F6b_multi512_16c_R4_mesh8 scatter_multi "16 500 512" 16 X86O3CPU $KN_R4 $BUF16 &
+    MODES=$PERF3 BANKS=8 EXTRA="--num-dirs=8" matrix F6c_multi512_16c_R4_xbar8d scatter_multi "16 500 512" 16 X86O3CPU $KN_R4 $BUF16 &
+    MODES=$PERF3 matrix F7_rw800k_16c_T4_thr1 scatter_rw "16 50000 32 8" 16 X86O3CPU $KN_T4 $BUF16 DSTATE_THRESHOLD=1 &
+    wait ;;
   apps2)
     # CMS again (its conventional relaxed run hit gem5's missing Garnet functional
     # read, fixed in the patch), the Zipfian program at 25x the adds, and SpMV on a
