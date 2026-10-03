@@ -127,6 +127,10 @@ def create_system(
     hotwords = bounded_env("DSTATE_HOTWORDS", "0", 0, 1024)
     merge_limit = bounded_env("DSTATE_MERGE_LIMIT", "0", 0, 64)
     delegate_from_s = flag_env("DSTATE_DELEGATE_FROM_S", "0")
+    # Requester-side owner-tenure predictor (L1): max adds per tenure to still delegate.
+    max_tenure = bounded_env("DSTATE_MAX_TENURE", "0", 0, 1 << 20)
+    tenure_idle = bounded_env("DSTATE_TENURE_IDLE", "0", 0, 1 << 30)
+    tenure_probe = flag_env("DSTATE_TENURE_PROBE", "0")
     # O3 only: no-return atomics bypass TSO's one-store-in-flight rule (Intel
     # RAO-INT's weakly ordered contract). Software fences where it publishes.
     relaxed_amo = flag_env("DSTATE_RELAXED_AMO", "0")
@@ -137,6 +141,11 @@ def create_system(
     writer_epoch = bounded_env("DSTATE_WRITER_EPOCH", "64", 1, 1 << 20)
     promote_writers = bounded_env("DSTATE_PROMOTE_WRITERS", "0", 0, 64)
     ack_value = flag_env("DSTATE_ACK_VALUE", "0")
+    # Change-rate gate, its floor, time-based decay of the gate table, adaptation.
+    min_change_pct = bounded_env("DSTATE_MIN_CHANGE_PCT", "0", 0, 100)
+    min_changes = bounded_env("DSTATE_MIN_CHANGES", "2", 1, 1 << 20)
+    writer_idle = bounded_env("DSTATE_WRITER_IDLE", "0", 0, 1 << 30)
+    adaptive_gate = flag_env("DSTATE_ADAPTIVE_GATE", "0")
     for cpu in cpus:
         try:
             cpu.relaxedNoReturnAtomics = relaxed_amo
@@ -190,6 +199,9 @@ def create_system(
             send_evictions=send_evicts(options),
             d_state_enabled=enabled,
             d_state_delegate_from_s=delegate_from_s,
+            d_state_max_tenure=max_tenure,
+            d_state_tenure_idle=tenure_idle,
+            d_state_tenure_probe=tenure_probe,
             number_of_TBEs=num_tbes,
             transitions_per_cycle=options.ports,
             clk_domain=clk_domain,
@@ -279,6 +291,10 @@ def create_system(
             d_state_writer_epoch=writer_epoch,
             d_state_promote_writers=promote_writers,
             d_state_ack_value=ack_value,
+            d_state_min_change_pct=min_change_pct,
+            d_state_min_changes=min_changes,
+            d_state_writer_idle=writer_idle,
+            d_state_adaptive_gate=adaptive_gate,
             d_state_hit_latency=hit_latency,
             d_state_hotwords=hotwords,
             d_state_merge_limit=merge_limit,

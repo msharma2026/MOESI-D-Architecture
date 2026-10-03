@@ -63,8 +63,14 @@ structure(DStateEngine, external="yes") {
   void hotWordDrop(Addr);
   void hotWordTouchMask(Addr, int, int, int);
   bool masksValid(int, int);
-  int writersAfter(Addr, NodeID);
-  void noteWriter(Addr, NodeID, int);
+  int writersAfter(Addr, NodeID, Cycles, int);
+  int changesAfter(Addr, NodeID, Cycles, int);
+  int changePct(Addr, NodeID, Cycles, int);
+  void noteAccess(Addr, NodeID, Cycles, int, int, int);
+  int gatePct(int, bool);
+  void noteOwnerAdd(Addr);
+  void noteOwnershipLost(Addr, Cycles);
+  int predictedTenure(Addr, Cycles, int);
   uint64_t nextId();
 }
 

@@ -286,6 +286,16 @@ machine(MachineType:Directory, "Directory protocol")
     return false;
   }
 
+  // gem5 functional reads (syscall emulation) of a line whose only fresh copy
+  // is a response in flight find no readable copy; RubySystem then reads the
+  // Maybe_Stale controller with the lowest priority value. Prefer the L2 copy
+  // (20) over memory through the directory (30), as MESI_Two_Level does.
+  // Without a priority gem5 aborts the run (seen when a thread exits while
+  // another core polls its TLS line; unrelated to delegated updates).
+  int functionalReadPriority() {
+    return 30;
+  }
+
   // ** OUT_PORTS **
   out_port(forwardNetwork_out, RequestMsg, forwardFromDir);
   out_port(responseNetwork_out, ResponseMsg, responseFromDir);

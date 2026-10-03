@@ -216,6 +216,50 @@ admits CMS (+22%). The writer count separates single-writer from shared lines,
 not the two kinds of shared line; the signal that would is the owner's expected
 hit rate, which the home does not observe.
 
+### Round 7 (2026-10-02): change-rate gate, owner-tenure predictor, functional-read priorities
+
+Gates on the round-7 build, every mode CORRECT and through the coverage gate:
+regression with the change-rate gate (50 %) plus batching, ACK value and
+promotion on O3 TSO; gate alone on Minor TSO; gate plus ACK value on O3
+fenced-relaxed; gate with adaptation on O3 TSO; tenure predictor (threshold 1)
+with and without probing on O3 TSO, Minor TSO and O3 fenced-relaxed: 4/4 each,
+nine matrices, both admission paths exercised in every one (the floor rejects a
+line's first touch, 132 per run; 13,000–21,000 delegations accepted). Ordering
+litmus with each new knob on: 0 forbidden in every run (L50–L53).
+
+Two infrastructure findings this round, both fixed before any number was taken:
+
+1. **Functional reads of lines in flight.** gem5's syscall emulation reads
+   memory functionally; a read of a line whose only fresh copy was a response in
+   transit between two L1s found no readable copy and aborted the run
+   (`Ruby functional read failed`). The protocol trace shows the mechanism:
+   core 0 polls the exiting thread's `tid` word (pthread_join) while core 1,
+   exiting, stores into the same TLS line; the GETX takes the line from core 0
+   at the instant of the functional read. Nothing delegated is involved. gem5's
+   intended fallback is a per-controller `functionalReadPriority()` that lets
+   `RubySystem` read a Maybe_Stale copy; MOESI_CMP_directory does not declare
+   one, so the L2 (20) and directory (30) now do, as `MESI_Two_Level` does. A
+   first attempt that read the backing store from `RubyPort` segfaulted
+   (`phys_mem` is NULL unless `--access-backing-store` is set) and was
+   reverted; it never shipped in the patch. Three aborted runs were archived
+   outside the run table and rerun on the fixed build.
+2. **Builds and driver edits during a running chain.** Rebuilding `gem5.opt`
+   while a chain launches runs, and editing `tools/ablate.sh` while bash is
+   executing it, each corrupted a batch (four 16-core matrices, one phase).
+   Those runs were archived and repeated; the rule is now in the driver's
+   header comment.
+
+Design finding, recorded because it bounds what the home can do: the change
+ratio the home measures is an upper bound on the true migration rate. While a
+line is conventional the owner's local hits are invisible to the home; while it
+is delegated, requester-side combining folds a core's run of adds into one
+request. Both inflate the ratio toward 100 %, which is why the sketch at 4
+cores (true ratio 0.21) is still admitted by a 50 % threshold until time decay
+rejects its quiet lines. The requester-side tenure predictor sees the true
+owner hit rate but only its own, and at 16 cores reads an owner's two or three
+adds before the recall as "owner wins"; it is a 4-core refinement, not a
+general policy (round-7 section of the results page).
+
 ### Measurement caveats that apply to every number
 
 - **Whole-program `simSeconds`, no ROI.** `libm5` was not built, so times include

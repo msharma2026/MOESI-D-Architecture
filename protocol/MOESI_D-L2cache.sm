@@ -81,6 +81,18 @@ machine(MachineType:L2Cache, "Token protocol")
   // resumes. 0 disables the gate (accept everything, as before).
   int d_state_min_writers := 0;
   int d_state_writer_epoch := 64;
+  // Change-rate gate: admit when the line's would-be ownership changes per
+  // hundred updates (GETX from a non-owner when conventional, update from a core
+  // other than the previous writer when delegated) reach d_state_min_change_pct
+  // and at least d_state_min_changes changes have been seen. The counters decay
+  // by halving every d_state_writer_epoch updates. 0 disables.
+  int d_state_min_change_pct := 0;
+  int d_state_min_changes := 2;
+  // Time-based decay of the gate table: a line idle for this many cycles
+  // restarts as single-writer (0: the update-count epoch resets the bitmap).
+  int d_state_writer_idle := 0;
+  // Per-bank adaptation of d_state_min_change_pct with a cooling-off period.
+  bool d_state_adaptive_gate := "False";
   // Promotion to D on distinct writers in the epoch (0: the update-count rule).
   int d_state_promote_writers := 0;
   // The terminal ACK carries the updated word (16 B response class) so the
@@ -329,6 +341,17 @@ machine(MachineType:L2Cache, "Token protocol")
   PerfectCacheMemory localDirectory, template="<L2Cache_DirEntry>";
 
   Tick clockEdge();
+  Cycles curCycle();
+
+  // gem5 functional reads (syscall emulation) of a line whose only fresh copy
+  // is a response in flight find no readable copy; RubySystem then reads the
+  // Maybe_Stale controller with the lowest priority value. Prefer the L2 copy
+  // (20) over memory through the directory (30), as MESI_Two_Level does.
+  // Without a priority gem5 aborts the run (seen when a thread exits while
+  // another core polls its TLS line; unrelated to delegated updates).
+  int functionalReadPriority() {
+    return 20;
+  }
   Tick cyclesToTicks(Cycles c);
   void set_cache_entry(AbstractCacheEntry b);
   void unset_cache_entry();
@@ -935,8 +958,19 @@ machine(MachineType:L2Cache, "Token protocol")
           // the home has no entry for counts as single-writer: it starts owned.
           bool few_writers := false;
           if (d_state_min_writers > 0) {
-            few_writers := dStateEngine.writersAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor)) <
-                           d_state_min_writers;
+            few_writers := dStateEngine.writersAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor),
+                                                     curCycle(), d_state_writer_idle) < d_state_min_writers;
+          }
+          // Change-rate gate (see d_state_min_change_pct): too few would-be
+          // ownership changes, or too small a share of the line's updates.
+          if (d_state_min_change_pct > 0) {
+            int gate_pct := dStateEngine.gatePct(d_state_min_change_pct, d_state_adaptive_gate);
+            if (dStateEngine.changesAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor),
+                                          curCycle(), d_state_writer_idle) < d_state_min_changes ||
+                dStateEngine.changePct(in_msg.addr, machineIDToNodeID(in_msg.Requestor),
+                                       curCycle(), d_state_writer_idle) < gate_pct) {
+              few_writers := true;
+            }
           }
           TBE ptbe := TBEs[in_msg.addr];
           bool mergeable := pending && d_state_merge_limit > 0 && is_valid(ptbe) &&
@@ -974,8 +1008,8 @@ machine(MachineType:L2Cache, "Token protocol")
             trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);
           } else if (dstateWouldPromote(ce, in_msg.Requestor) || st == State:D ||
                      (d_state_promote_writers > 0 && d_state_persistence &&
-                      dStateEngine.writersAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor)) >=
-                      d_state_promote_writers)) {
+                      dStateEngine.writersAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor),
+                                                curCycle(), d_state_writer_idle) >= d_state_promote_writers)) {
             trigger(Event:DState_Hot, in_msg.addr, ce, TBEs[in_msg.addr]);
           } else {
             trigger(Event:DState_Cold, in_msg.addr, ce, TBEs[in_msg.addr]);
@@ -1878,9 +1912,16 @@ machine(MachineType:L2Cache, "Token protocol")
   // Up to d_state_queue_depth accepted operations per L2 bank (one per line, since
   // the TBE is per address); reserve the executor slot and TBE/cache slot before
   // consuming the request. NACK is terminal non-acceptance, never a timeout or replay.
-  action(d_noteWriter, "dwriter", desc="Record the requester in the line's distinct-writer epoch") {
+  action(d_noteWriter, "dwriter", desc="Record a rejected delegated update in the gate table") {
     peek(L1requestNetwork_in, RequestMsg) {
-      dStateEngine.noteWriter(address, machineIDToNodeID(in_msg.Requestor), d_state_writer_epoch);
+      dStateEngine.noteAccess(address, machineIDToNodeID(in_msg.Requestor), curCycle(),
+                              d_state_writer_epoch, d_state_writer_idle, 0);
+    }
+  }
+  action(d_noteMigration, "dmigr", desc="Record a conventional ownership transfer in the gate table") {
+    peek(L1requestNetwork_in, RequestMsg) {
+      dStateEngine.noteAccess(address, machineIDToNodeID(in_msg.Requestor), curCycle(),
+                              d_state_writer_epoch, d_state_writer_idle, 2);
     }
   }
   action(d_reject, "drej", desc="Reject before application") {
@@ -1929,7 +1970,8 @@ machine(MachineType:L2Cache, "Token protocol")
         tbe.DStateMerged.orMasks(in_msg.DStateMask32, in_msg.DStateMask64);
       }
       tbe.DStateMerged.add(in_msg.Requestor, in_msg.DStateId);
-      dStateEngine.noteWriter(address, machineIDToNodeID(in_msg.Requestor), d_state_writer_epoch);
+      dStateEngine.noteAccess(address, machineIDToNodeID(in_msg.Requestor), curCycle(),
+                              d_state_writer_epoch, d_state_writer_idle, 1);
     }
   }
   action(d_start, "dstart", desc="Charge service time; successive starts are spaced by the initiation interval") {
@@ -1975,7 +2017,8 @@ machine(MachineType:L2Cache, "Token protocol")
     if (cache_entry.DStateReqCount < d_state_hot_threshold) {
       cache_entry.DStateReqCount := cache_entry.DStateReqCount + 1;
     }
-    dStateEngine.noteWriter(address, machineIDToNodeID(tbe.DStateOrig), d_state_writer_epoch);
+    dStateEngine.noteAccess(address, machineIDToNodeID(tbe.DStateOrig), curCycle(),
+                            d_state_writer_epoch, d_state_writer_idle, 1);
     cache_entry.DStateReadRun := 0;
     tbe.DStateHasOp := false;
   }
@@ -2458,6 +2501,7 @@ machine(MachineType:L2Cache, "Token protocol")
   // LOCAL REQUESTS SATISFIED LOCALLY
 
   transition(OLSX, L1_GETX, IFLOX) {
+    d_noteMigration;
     i_allocateTBE;
     s_recordGetXL1ID;
     // count number of INVs needed that doesn't include requestor
@@ -2527,6 +2571,7 @@ machine(MachineType:L2Cache, "Token protocol")
   }
 
   transition({ILX, ILOX}, L1_GETX, IFLOXX) {
+    d_noteMigration;
     kk_forwardLocalGETXToLocalExclusive;
     e_sendAckToL1Requestor;
     uu_profileMiss;
@@ -2577,6 +2622,7 @@ machine(MachineType:L2Cache, "Token protocol")
 
 
   transition(ILOSX, L1_GETX, IFLXO) {
+    d_noteMigration;
     i_allocateTBE;
     s_recordGetXL1ID;
     h_countLocalSharersExceptRequestor;
@@ -2610,6 +2656,7 @@ machine(MachineType:L2Cache, "Token protocol")
   }
 
   transition(I, L1_GETX, IGM) {
+    d_noteMigration;
     i_allocateTBE;
     s_recordGetXL1ID;
     a_issueGETX;
@@ -2618,6 +2665,7 @@ machine(MachineType:L2Cache, "Token protocol")
   }
 
   transition(S, L1_GETX, IGM) {
+    d_noteMigration;
     i_allocateTBE;
     s_recordGetXL1ID;
     a_issueGETX;
@@ -2629,6 +2677,7 @@ machine(MachineType:L2Cache, "Token protocol")
   }
 
   transition(ILS, L1_GETX, IGMLS) {
+    d_noteMigration;
     i_allocateTBE;
     s_recordGetXL1ID;
     a_issueGETX;
@@ -2673,6 +2722,7 @@ machine(MachineType:L2Cache, "Token protocol")
 
 
   transition(ILOS, L1_GETX, IGMIO) {
+    d_noteMigration;
     i_allocateTBE;
     s_recordGetXL1ID;
     a_issueGETX;
@@ -2692,6 +2742,7 @@ machine(MachineType:L2Cache, "Token protocol")
   }
 
   transition(OLS, L1_GETX, OGMIO) {
+    d_noteMigration;
     i_allocateTBE;
     s_recordGetXL1ID;
     a_issueGETX;
@@ -2710,6 +2761,7 @@ machine(MachineType:L2Cache, "Token protocol")
   }
 
   transition(ILO, L1_GETX, IGMIO) {
+    d_noteMigration;
     i_allocateTBE;
     s_recordGetXL1ID;
     a_issueGETX;
@@ -2867,6 +2919,7 @@ machine(MachineType:L2Cache, "Token protocol")
 
 
   transition(SLS, L1_GETX, IGMLS) {
+    d_noteMigration;
     i_allocateTBE;
     s_recordGetXL1ID;
     a_issueGETX;
@@ -2895,6 +2948,7 @@ machine(MachineType:L2Cache, "Token protocol")
 
 
   transition(O, L1_GETX, IGMO) {
+    d_noteMigration;
     i_allocateTBE;
     s_recordGetXL1ID;
     a_issueGETX;
@@ -2934,6 +2988,7 @@ machine(MachineType:L2Cache, "Token protocol")
   // LOCAL REQUESTS SATISFIED DIRECTLY BY L2
 
   transition(M, L1_GETX, MM) {
+    d_noteMigration;
     i_allocateTBE;
     // should count 0 of course
     h_countLocalSharersExceptRequestor;
@@ -3565,6 +3620,7 @@ machine(MachineType:L2Cache, "Token protocol")
     m_popRequestQueue;
   }
   transition(D, L1_GETX, MM) {
+    d_noteMigration;
     i_allocateTBE;
     h_countLocalSharersExceptRequestor;
     d_sendDataToL1GETX;

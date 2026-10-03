@@ -144,6 +144,29 @@ class ArtifactChecks(unittest.TestCase):
         self.assertIn("trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);", l2[i:i + 700])
 
 
+    def test_round7_change_gate_and_tenure_predictor_guards(self):
+        l1 = (ROOT / "protocol/MOESI_D-L1cache.sm").read_text(encoding="utf-8")
+        eng = (ROOT / "protocol/DStateEngine.hh").read_text(encoding="utf-8")
+        # The predictor only ever downgrades a delegation to the ordinary GETX
+        # path (LocalAtomic_CPU); it never invents a delegation.
+        self.assertIn("if (d_state_enabled && localOnly == false && tenureAllowsDelegation(addr)) "
+                      "{ return Event:DStateReq_CPU; }", l1)
+        self.assertIn("if (d_state_max_tenure == 0) { return true; }", l1)
+        self.assertIn("if (tenure < 0) { return d_state_tenure_probe == false; }", l1)
+        # Every way an owned line leaves this L1 records the tenure (8 transitions),
+        # and every locally applied add counts toward it.
+        self.assertEqual(l1.count("    d_noteOwnershipLost;\n"), 8)
+        self.assertIn("dStateRequests.noteOwnerAdd(address);", l1)
+        self.assertIn("int predictedTenure(std::uint64_t line, std::uint64_t now, std::uint64_t idle) const", eng)
+        # The gate tables are bounded (hardware-sized), not unbounded maps.
+        self.assertIn("kWriterTable = 1024", eng)
+        self.assertIn("kTenureTable = 1024", eng)
+        # Functional-read fallback order: L2 copy before memory via the directory.
+        l2 = (ROOT / "protocol/MOESI_D-L2cache.sm").read_text(encoding="utf-8")
+        d = (ROOT / "protocol/MOESI_D-dir.sm").read_text(encoding="utf-8")
+        self.assertIn("int functionalReadPriority() {\n    return 20;", l2)
+        self.assertIn("int functionalReadPriority() {\n    return 30;", d)
+
     def test_round6_gate_ackvalue_and_sameline_guards(self):
         """Round 6: the gate rejects before acceptance and records writers on both
         paths; the ACK value completes only loads inside the add's own word; the
@@ -152,8 +175,13 @@ class ArtifactChecks(unittest.TestCase):
         l2 = (ROOT / "protocol/MOESI_D-L2cache.sm").read_text(encoding="utf-8")
         self.assertIn("} else if (few_writers) {", l2)
         self.assertIn("d_noteWriter;", l2)
-        self.assertIn("dStateEngine.writersAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor)) <", l2)
-        self.assertIn("dStateEngine.noteWriter(address, machineIDToNodeID(tbe.DStateOrig), d_state_writer_epoch);", l2)
+        self.assertIn("curCycle(), d_state_writer_idle) < d_state_min_writers", l2)
+        self.assertIn("dStateEngine.noteAccess(address, machineIDToNodeID(tbe.DStateOrig), curCycle(),", l2)
+        # Round 7: the change-rate gate rejects before any acceptance path, and
+        # every stable-state GETX feeds the gate table (13 transitions).
+        self.assertIn("dStateEngine.changePct(in_msg.addr, machineIDToNodeID(in_msg.Requestor),", l2)
+        self.assertEqual(l2.count("    d_noteMigration;\n"), 13)
+        self.assertLess(l2.index("if (d_state_min_change_pct > 0) {"), l2.index("} else if (mergeable) {"))
         seq = (ROOT / "protocol/ruby-integration.patch").read_text(encoding="utf-8")
         self.assertIn("requests.front().pkt->getAddr() + requests.front().pkt->getSize() <= word_hi", seq)
         self.assertIn("storeInFlight = inFlightAtomics > 0;", seq)

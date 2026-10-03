@@ -19,6 +19,9 @@
 #            bench/ binaries were built; default: MOESI_D_SRC), SCATTER_ARGS, RW_ARGS.
 set -u
 SRC=${MOESI_D_SRC:-$(cd "$(dirname "$0")/.." && pwd)}
+# Never rebuild gem5.opt or edit this script while a chain is running: bash reads
+# the script incrementally, and a gem5 process exec-ed while the binary is being
+# written crashes. Archive affected runs and repeat them.
 TREE=${GEM5_TREE:?set GEM5_TREE to the patched gem5 worktree}
 W=${BENCH_DIR:-$SRC}
 OUT=${OUT:?set OUT to a results directory}; mkdir -p "$OUT"
@@ -562,6 +565,109 @@ v6)
     wait ;;
   all)
     for ph in gates strict reads regress16; do echo "--- $ph $(date +%H:%M)"; bash "$0" v6 $ph; done ;;
+  esac ;;
+v7)
+  # Round 7: change-rate admission gate (would-be ownership changes per update, counted at
+  # the home in both modes), time-based decay of the gate table, adaptive threshold.
+  # Phases: gates | strict | sixteen | all
+  KN_V3="DSTATE_QUEUE_DEPTH=16 DSTATE_INIT_INTERVAL=4 DSTATE_BUSY_STALL=1 DSTATE_QUEUE_STALL=1 DSTATE_REQ_COMBINE=16 DSTATE_MERGE_LIMIT=64"
+  FAR="DSTATE_FAR_READS=1 DSTATE_READ_DOWNGRADE=64 DSTATE_EVICT_FOR_DELEGATE=1"
+  KN_T4="$KN_V3 DSTATE_EXEC_LATENCY=20 $FAR"
+  KN_TH4="$KN_V3 DSTATE_HOTWORDS=32 DSTATE_HIT_LATENCY=4 $FAR"
+  KN_R4="$KN_TH4 DSTATE_RELAXED_AMO=1 DSTATE_DELTA_MIN_WORDS=2"
+  SL="DSTATE_TSO_SAMELINE=1 DSTATE_DELTA_MIN_WORDS=2"
+  ACKV="DSTATE_ACK_VALUE=1"
+  PW="DSTATE_PROMOTE_WRITERS=2"
+  BUF16="DSTATE_BUFFER_SIZE=${BUF16:-256}"
+  IDLE="DSTATE_WRITER_IDLE=200000"
+  CG="DSTATE_MIN_CHANGE_PCT=50 DSTATE_MIN_CHANGES=2 $IDLE"
+  CG30="DSTATE_MIN_CHANGE_PCT=30 DSTATE_MIN_CHANGES=2 $IDLE"
+  CGA="$CG DSTATE_ADAPTIVE_GATE=1"
+  PERF3="local,remote,persistent"
+  case ${2:-all} in
+  gates)
+    matrix G40_regress_TH4_SCV_o3     coherence_regression        "" 5 X86O3CPU    $KN_TH4 $SL $CG $ACKV $PW &
+    matrix G41_regress_TH4_C_minor    coherence_regression        "" 5 X86MinorCPU $KN_TH4 $CG &
+    matrix G42_regress_R4_CV_fenced   coherence_regression_fenced "" 5 X86O3CPU    $KN_R4 $CG $ACKV &
+    matrix G43_regress_TH4_SCA_o3     coherence_regression        "" 5 X86O3CPU    $KN_TH4 $SL $CGA &
+    wait
+    litmus L50_litmus_unfenced_T4_SC          ordering_litmus  DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_TH4 $SL $CG &
+    litmus L51_litmus2_unfenced_T4_SC         ordering_litmus2 DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_TH4 $SL $CG &
+    wait ;;
+  strict)
+    # the test the writer gate failed: keep the 512-line win AND refuse CMS, at 4 cores
+    MODES=$PERF3 matrix C0_cms_T4_SC                cms_dstate     "4 20000"        4 X86O3CPU $KN_T4 $SL $CG &
+    MODES=$PERF3 matrix C1_multi512_T4_SC           scatter_multi  "4 2000 512"     4 X86O3CPU $KN_T4 $SL $CG &
+    MODES=$PERF3 matrix C2_hotkey800k_TH4_SC        scatter_dstate "4 200000 1"     4 X86O3CPU $KN_TH4 $SL $CG &
+    wait
+    MODES=$PERF3 matrix C3_rw800k_T4_SCVP           scatter_rw     "4 200000 32 8"  4 X86O3CPU $KN_T4 $SL $CG $ACKV $PW &
+    MODES=$PERF3 matrix C4_cms_T4_SCA               cms_dstate     "4 20000"        4 X86O3CPU $KN_T4 $SL $CGA &
+    MODES=$PERF3 matrix C5_multi512_T4_SCA          scatter_multi  "4 2000 512"     4 X86O3CPU $KN_T4 $SL $CGA &
+    wait
+    MODES=$PERF3 matrix C6_cms_T4_SC30              cms_dstate     "4 20000"        4 X86O3CPU $KN_T4 $SL $CG30 &
+    MODES=$PERF3 matrix C7_rw800k_T4_SC30VP         scatter_rw     "4 200000 32 8"  4 X86O3CPU $KN_T4 $SL $CG30 $ACKV $PW &
+    MODES=$PERF3 matrix C8_multi512_R4_C            scatter_multi  "4 2000 512"     4 X86O3CPU $KN_R4 $CG &
+    wait ;;
+  sixteen)
+    export TIMEOUT=7200
+    MODES=$PERF3 matrix C16_multi512_16c_R4_C       scatter_multi  "16 500 512"     16 X86O3CPU $KN_R4 $CG $BUF16 &
+    MODES=$PERF3 matrix C17_hotkey800k_16c_TH4_SC   scatter_dstate "16 50000 1"     16 X86O3CPU $KN_TH4 $SL $CG $BUF16 &
+    wait
+    MODES=$PERF3 matrix C18_rw800k_16c_T4_SCVP      scatter_rw     "16 50000 32 8"  16 X86O3CPU $KN_T4 $SL $CG $ACKV $PW $BUF16 &
+    MODES=$PERF3 matrix C19_phased512_16c_R4_C      scatter_phased "16 25 512 8"    16 X86O3CPU $KN_R4 $CG $BUF16 &
+    wait
+    MODES=$PERF3 matrix C20_cms_16c_T4_SC           cms_dstate     "16 5000"        16 X86O3CPU $KN_T4 $SL $CG $BUF16 &
+    wait ;;
+  tenure)
+    # requester-side owner-tenure predictor: the owner hit-rate signal the home lacks.
+    # The change-rate gate here runs without idle decay (DSTATE_WRITER_IDLE shifts
+    # timing into a gem5 SE functional-read limitation on the CMS binary).
+    CG0="DSTATE_MIN_CHANGE_PCT=50 DSTATE_MIN_CHANGES=2"
+    TEN="DSTATE_MAX_TENURE=1"
+    matrix G44_regress_TH4_ST_o3      coherence_regression        "" 5 X86O3CPU    $KN_TH4 $SL $TEN $ACKV $PW &
+    matrix G45_regress_R4_T_fenced    coherence_regression_fenced "" 5 X86O3CPU    $KN_R4 $TEN &
+    litmus L52_litmus_unfenced_T4_ST          ordering_litmus  DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_TH4 $SL $TEN &
+    wait
+    MODES=$PERF3 matrix T0_cms_T4_ST                cms_dstate     "4 20000"        4 X86O3CPU $KN_T4 $SL $TEN &
+    MODES=$PERF3 matrix T1_multi512_T4_ST           scatter_multi  "4 2000 512"     4 X86O3CPU $KN_T4 $SL $TEN &
+    MODES=$PERF3 matrix T2_rw800k_T4_STVP           scatter_rw     "4 200000 32 8"  4 X86O3CPU $KN_T4 $SL $TEN $ACKV $PW &
+    wait
+    MODES=$PERF3 matrix T3_hotkey800k_TH4_ST        scatter_dstate "4 200000 1"     4 X86O3CPU $KN_TH4 $SL $TEN &
+    MODES=$PERF3 matrix T4_cms_T4_STC0              cms_dstate     "4 20000"        4 X86O3CPU $KN_T4 $SL $TEN $CG0 &
+    MODES=$PERF3 matrix T5_cms_T4_SC0               cms_dstate     "4 20000"        4 X86O3CPU $KN_T4 $SL $CG0 &
+    wait
+    # 16-core tenure runs are in the probe phase: without probing the predictor never samples
+    wait ;;
+  probe)
+    # tenure predictor with probing: a line with no recorded tenure is owned first
+    # so the tenure can be measured; records expire (re-probe) after 1M cycles.
+    CG0="DSTATE_MIN_CHANGE_PCT=50 DSTATE_MIN_CHANGES=2"
+    PR="DSTATE_MAX_TENURE=1 DSTATE_TENURE_PROBE=1 DSTATE_TENURE_IDLE=1000000"
+    matrix G46_regress_TH4_SPV_o3     coherence_regression        "" 5 X86O3CPU    $KN_TH4 $SL $PR $ACKV $PW &
+    matrix G47_regress_R4_P_fenced    coherence_regression_fenced "" 5 X86O3CPU    $KN_R4 $PR &
+    matrix G48_regress_TH4_P_minor    coherence_regression        "" 5 X86MinorCPU $KN_TH4 $PR &
+    litmus L53_litmus_unfenced_T4_SP          ordering_litmus  DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_TH4 $SL $PR &
+    wait
+    MODES=$PERF3 matrix P0_cms_T4_SP                cms_dstate     "4 20000"        4 X86O3CPU $KN_T4 $SL $PR &
+    MODES=$PERF3 matrix P1_multi512_T4_SP           scatter_multi  "4 2000 512"     4 X86O3CPU $KN_T4 $SL $PR &
+    MODES=$PERF3 matrix P2_rw800k_T4_SPVP           scatter_rw     "4 200000 32 8"  4 X86O3CPU $KN_T4 $SL $PR $ACKV $PW &
+    wait
+    MODES=$PERF3 matrix P3_hotkey800k_TH4_SP        scatter_dstate "4 200000 1"     4 X86O3CPU $KN_TH4 $SL $PR &
+    MODES=$PERF3 matrix P4_cms_T4_SPC0              cms_dstate     "4 20000"        4 X86O3CPU $KN_T4 $SL $PR $CG0 &
+    MODES=$PERF3 matrix P5_multi512_R4_P            scatter_multi  "4 2000 512"     4 X86O3CPU $KN_R4 $PR &
+    wait
+    MODES=$PERF3 matrix P6_scatter800k_T4_SP        scatter_dstate "4 200000 32"    4 X86O3CPU $KN_T4 $SL $PR &
+    MODES=$PERF3 matrix P7_phased512_R4_P           scatter_phased "4 100 512 8"    4 X86O3CPU $KN_R4 $PR &
+    wait
+    export TIMEOUT=7200
+    MODES=$PERF3 matrix P16_multi512_16c_R4_P       scatter_multi  "16 500 512"     16 X86O3CPU $KN_R4 $PR $BUF16 &
+    MODES=$PERF3 matrix P17_rw800k_16c_T4_SPVP      scatter_rw     "16 50000 32 8"  16 X86O3CPU $KN_T4 $SL $PR $ACKV $PW $BUF16 &
+    wait
+    MODES=$PERF3 matrix P18_hotkey800k_16c_TH4_SP   scatter_dstate "16 50000 1"     16 X86O3CPU $KN_TH4 $SL $PR $BUF16 &
+    MODES=$PERF3 matrix P19_cms_16c_T4_SP           cms_dstate     "16 5000"        16 X86O3CPU $KN_T4 $SL $PR $BUF16 &
+    wait ;;
+  all)
+    for ph in gates strict sixteen tenure probe; do echo "--- $ph $(date +%H:%M)"; bash "$0" v7 $ph; done ;;
   esac ;;
 report)
   # One row per (run, mode). Update/response message counts come from the L1's terminal

@@ -271,6 +271,50 @@ progress but do **not** prove deadlock freedom with finite queues. Required
 remaining work includes dependency graphs, adversarial interleavings and
 bounded model checking, followed by randomized CPU-generated atomic traffic.
 
+## 4a. Admission: which lines to delegate
+
+Delegation wins when a line would otherwise migrate on nearly every update and
+loses when the owner would have kept hitting it locally. At four cores the
+conventional protocol's own record of this is unambiguous: one ownership
+transfer per 4.8 adds on the Count-Min sketch (the owner wins by 24 %), one per
+4.2 on the single hot word (a tie once same-line batching is on), one per 2 on
+the read-mixed line (the owner wins by 40 %), one per 1.0 on 512 scattered lines
+(delegation wins by 21 %). The signal that decides is the **owner hit rate**:
+how many updates the owner performs per ownership. Two mechanisms estimate it;
+both default off.
+
+**Change-rate gate (home side).** The L2 bank keeps a bounded table (1,024
+lines) of each line's recent updates and *would-be ownership changes*: a GETX
+from a non-owner while the line is conventional, an update from a core other
+than the previous writer while it is delegated. Counting both ways keeps the
+estimate alive while the line is delegated, when there are no migrations to
+observe. Counters halve every `d_state_writer_epoch` updates, so a steadily
+contested line keeps a steady ratio and never bounces between modes; an idle
+line restarts after `d_state_writer_idle` cycles. The home's view is
+incomplete by construction: the owner's local hits are invisible to it while
+the line is conventional, and requester-side combining folds a core's run of
+adds into one request while it is delegated, so the ratio it measures is an
+upper bound on the true change rate. In the ablations this separates
+single-writer lines from shared ones and costs nothing at 16 cores (every line
+clears the gate), but it admits the Count-Min sketch at 4 cores, where the
+owner wins.
+
+**Owner-tenure predictor (requester side).** The L1 sees exactly what the home
+cannot: how many adds it performed on a line it owned before another core took
+it. It records that tenure when the line leaves (taken by a writer or a reader,
+or evicted), in a bounded table, and delegates only lines whose last tenure was
+at most `d_state_max_tenure`. A line it has never owned carries no evidence;
+with `d_state_tenure_probe` it is owned first so the tenure can be measured, and
+a record expires after `d_state_tenure_idle` cycles so a delegated line is
+re-probed periodically (without probing, a line that starts delegated is never
+measured again). The probe is the sampling phase: one ownership per probe
+period per line, a few migrations, after which every core has a fresh tenure
+and the line settles into whichever mode its tenure says.
+
+Neither mechanism adds a message or a message field; both are tables at a
+controller plus a comparison on the existing admission path, and the predictor
+only ever downgrades a delegation to the ordinary GETX path.
+
 ## 5. Open implementation obligations
 
 Do not bypass these obligations by calling the design a small ALU addition:

@@ -1917,10 +1917,10 @@ index 0000000..1ec40df
 +print("Exiting @ tick", m5.curTick(), "because", exit_event.getCause())
 diff --git a/configs/ruby/MOESI_D.py b/configs/ruby/MOESI_D.py
 new file mode 100644
-index 0000000..5bdd81e
+index 0000000..10fa976
 --- /dev/null
 +++ b/configs/ruby/MOESI_D.py
-@@ -0,0 +1,393 @@
+@@ -0,0 +1,409 @@
 +# Copyright (c) 2019 ARM Limited
 +# All rights reserved.
 +#
@@ -2050,6 +2050,10 @@ index 0000000..5bdd81e
 +    hotwords = bounded_env("DSTATE_HOTWORDS", "0", 0, 1024)
 +    merge_limit = bounded_env("DSTATE_MERGE_LIMIT", "0", 0, 64)
 +    delegate_from_s = flag_env("DSTATE_DELEGATE_FROM_S", "0")
++    # Requester-side owner-tenure predictor (L1): max adds per tenure to still delegate.
++    max_tenure = bounded_env("DSTATE_MAX_TENURE", "0", 0, 1 << 20)
++    tenure_idle = bounded_env("DSTATE_TENURE_IDLE", "0", 0, 1 << 30)
++    tenure_probe = flag_env("DSTATE_TENURE_PROBE", "0")
 +    # O3 only: no-return atomics bypass TSO's one-store-in-flight rule (Intel
 +    # RAO-INT's weakly ordered contract). Software fences where it publishes.
 +    relaxed_amo = flag_env("DSTATE_RELAXED_AMO", "0")
@@ -2060,6 +2064,11 @@ index 0000000..5bdd81e
 +    writer_epoch = bounded_env("DSTATE_WRITER_EPOCH", "64", 1, 1 << 20)
 +    promote_writers = bounded_env("DSTATE_PROMOTE_WRITERS", "0", 0, 64)
 +    ack_value = flag_env("DSTATE_ACK_VALUE", "0")
++    # Change-rate gate, its floor, time-based decay of the gate table, adaptation.
++    min_change_pct = bounded_env("DSTATE_MIN_CHANGE_PCT", "0", 0, 100)
++    min_changes = bounded_env("DSTATE_MIN_CHANGES", "2", 1, 1 << 20)
++    writer_idle = bounded_env("DSTATE_WRITER_IDLE", "0", 0, 1 << 30)
++    adaptive_gate = flag_env("DSTATE_ADAPTIVE_GATE", "0")
 +    for cpu in cpus:
 +        try:
 +            cpu.relaxedNoReturnAtomics = relaxed_amo
@@ -2113,6 +2122,9 @@ index 0000000..5bdd81e
 +            send_evictions=send_evicts(options),
 +            d_state_enabled=enabled,
 +            d_state_delegate_from_s=delegate_from_s,
++            d_state_max_tenure=max_tenure,
++            d_state_tenure_idle=tenure_idle,
++            d_state_tenure_probe=tenure_probe,
 +            number_of_TBEs=num_tbes,
 +            transitions_per_cycle=options.ports,
 +            clk_domain=clk_domain,
@@ -2202,6 +2214,10 @@ index 0000000..5bdd81e
 +            d_state_writer_epoch=writer_epoch,
 +            d_state_promote_writers=promote_writers,
 +            d_state_ack_value=ack_value,
++            d_state_min_change_pct=min_change_pct,
++            d_state_min_changes=min_changes,
++            d_state_writer_idle=writer_idle,
++            d_state_adaptive_gate=adaptive_gate,
 +            d_state_hit_latency=hit_latency,
 +            d_state_hotwords=hotwords,
 +            d_state_merge_limit=merge_limit,
@@ -2836,10 +2852,10 @@ index 5b584fb..b53aa87 100644
      default n
 diff --git a/src/mem/ruby/protocol/MOESI_D-L1cache.sm b/src/mem/ruby/protocol/MOESI_D-L1cache.sm
 new file mode 100644
-index 0000000..8c522ec
+index 0000000..c6c51d1
 --- /dev/null
 +++ b/src/mem/ruby/protocol/MOESI_D-L1cache.sm
-@@ -0,0 +1,1739 @@
+@@ -0,0 +1,1772 @@
 +/*
 + * Copyright (c) 2019-2020 ARM Limited
 + * All rights reserved
@@ -2894,6 +2910,16 @@ index 0000000..8c522ec
 +   // invalidates the stale sharer bit before applying; a NACK falls back to the
 +   // ordinary GETX path as usual. Default off.
 +   bool d_state_delegate_from_s := "False";
++   // Requester-side owner-tenure predictor: delegate a line only when, the last
++   // time this L1 owned it, it performed at most d_state_max_tenure adds before
++   // losing it (lines never owned are delegated). 0 disables. A recorded tenure
++   // expires after d_state_tenure_idle cycles (0: never).
++   int d_state_max_tenure := 0;
++   int d_state_tenure_idle := 0;
++   // Probe: a line with no recorded tenure (never owned here, or the record
++   // expired) is owned first so its tenure can be measured; without probing
++   // such lines are delegated and, once delegated, never measured again.
++   bool d_state_tenure_probe := "False";
 +
 +   // Message Queues
 +   // From this node's L1 cache TO the network
@@ -3016,6 +3042,7 @@ index 0000000..8c522ec
 +  }
 +
 +  Tick clockEdge();
++  Cycles curCycle();
 +  Tick cyclesToTicks(Cycles c);
 +  void set_cache_entry(AbstractCacheEntry b);
 +  void unset_cache_entry();
@@ -3151,13 +3178,22 @@ index 0000000..8c522ec
 +
 +  // localOnly: the sequencer's static-placement range (oracle runs) excludes this
 +  // add; it takes the conventional ownership path like DSTATE_ENABLED=0 would.
-+  Event mandatory_request_type_to_event(RubyRequestType type, bool localOnly) {
++  // Owner-tenure predictor (d_state_max_tenure): a line this L1 kept for more
++  // than the threshold adds last time is taken by the ordinary GETX path.
++  bool tenureAllowsDelegation(Addr addr) {
++    if (d_state_max_tenure == 0) { return true; }
++    int tenure := dStateRequests.predictedTenure(addr, curCycle(), d_state_tenure_idle);
++    if (tenure < 0) { return d_state_tenure_probe == false; }
++    return tenure <= d_state_max_tenure;
++  }
++
++  Event mandatory_request_type_to_event(RubyRequestType type, bool localOnly, Addr addr) {
 +    if (type == RubyRequestType:LD) {
 +      return Event:Load;
 +    } else if (type == RubyRequestType:IFETCH) {
 +      return Event:Ifetch;
 +    } else if (type == RubyRequestType:ATOMIC_NO_RETURN) {
-+      if (d_state_enabled && localOnly == false) { return Event:DStateReq_CPU; }
++      if (d_state_enabled && localOnly == false && tenureAllowsDelegation(addr)) { return Event:DStateReq_CPU; }
 +      return Event:LocalAtomic_CPU;
 +    } else if ((type == RubyRequestType:ST) || (type == RubyRequestType:ATOMIC) ||
 +               (type == RubyRequestType:ATOMIC_RETURN)) {
@@ -3290,7 +3326,7 @@ index 0000000..8c522ec
 +          Entry L1Icache_entry := getL1ICacheEntry(in_msg.LineAddress);
 +          if (is_valid(L1Icache_entry)) {
 +            // The tag matches for the L1, so the L1 asks the L2 for it.
-+            trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly),
++            trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly, in_msg.LineAddress),
 +                    in_msg.LineAddress, L1Icache_entry,
 +                    TBEs[in_msg.LineAddress]);
 +          } else {
@@ -3304,7 +3340,7 @@ index 0000000..8c522ec
 +            }
 +            if (L1Icache.cacheAvail(in_msg.LineAddress)) {
 +              // L1 does't have the line, but we have space for it in the L1 so let's see if the L2 has it
-+              trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly),
++              trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly, in_msg.LineAddress),
 +                      in_msg.LineAddress, L1Icache_entry,
 +                      TBEs[in_msg.LineAddress]);
 +            } else {
@@ -3327,12 +3363,12 @@ index 0000000..8c522ec
 +            State dst := getState(TBEs[in_msg.LineAddress], L1Dcache_entry, in_msg.LineAddress);
 +            if (in_msg.Type == RubyRequestType:ATOMIC_NO_RETURN && d_state_enabled &&
 +                d_state_delegate_from_s && in_msg.DStateLocalOnly == false &&
-+                dst == State:S) {
++                tenureAllowsDelegation(in_msg.LineAddress) && dst == State:S) {
 +              // Hold read-only: delegate rather than upgrade (knob).
 +              trigger(Event:DStateReq_CPU_S, in_msg.LineAddress, L1Dcache_entry,
 +                      TBEs[in_msg.LineAddress]);
 +            } else {
-+              trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly),
++              trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly, in_msg.LineAddress),
 +                      in_msg.LineAddress, L1Dcache_entry,
 +                      TBEs[in_msg.LineAddress]);
 +            }
@@ -3347,7 +3383,7 @@ index 0000000..8c522ec
 +            }
 +            if (L1Dcache.cacheAvail(in_msg.LineAddress)) {
 +              // L1 does't have the line, but we have space for it in the L1 let's see if the L2 has it
-+              trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly),
++              trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly, in_msg.LineAddress),
 +                      in_msg.LineAddress, L1Dcache_entry,
 +                      TBEs[in_msg.LineAddress]);
 +            } else {
@@ -3844,6 +3880,11 @@ index 0000000..8c522ec
 +    assert(is_valid(cache_entry));
 +    sequencer.atomicCallback(address, cache_entry.DataBlk);
 +    cache_entry.Dirty := true;
++    dStateRequests.noteOwnerAdd(address);
++  }
++
++  action(d_noteOwnershipLost, "dlost", desc="Record this L1's owner tenure of a line it is giving up") {
++    dStateRequests.noteOwnershipLost(address, curCycle());
 +  }
 +
 +
@@ -4049,6 +4090,7 @@ index 0000000..8c522ec
 +  }
 +
 +  transition(O, L1_Replacement, OI) {
++    d_noteOwnershipLost;
 +    i_allocateTBE;
 +    dd_issuePUTO;
 +    forward_eviction_to_cpu;
@@ -4056,6 +4098,7 @@ index 0000000..8c522ec
 +  }
 +
 +  transition(O, Fwd_GETX, I) {
++    d_noteOwnershipLost;
 +    ee_sendDataExclusive;
 +    forward_eviction_to_cpu;
 +    l_popForwardQueue;
@@ -4080,6 +4123,7 @@ index 0000000..8c522ec
 +  }
 +
 +  transition(MM, L1_Replacement, MI) {
++    d_noteOwnershipLost;
 +    i_allocateTBE;
 +    d_issuePUTX;
 +    forward_eviction_to_cpu;
@@ -4087,12 +4131,14 @@ index 0000000..8c522ec
 +  }
 +
 +  transition(MM, Fwd_GETX, I) {
++    d_noteOwnershipLost;
 +    ee_sendDataExclusive;
 +    forward_eviction_to_cpu;
 +    l_popForwardQueue;
 +  }
 +
 +  transition(MM, Fwd_GETS, I) {
++    d_noteOwnershipLost;
 +    ee_sendDataExclusive;
 +    forward_eviction_to_cpu;
 +    l_popForwardQueue;
@@ -4118,6 +4164,7 @@ index 0000000..8c522ec
 +  }
 +
 +  transition(M, L1_Replacement, MI) {
++    d_noteOwnershipLost;
 +    i_allocateTBE;
 +    d_issuePUTX;
 +    forward_eviction_to_cpu;
@@ -4125,6 +4172,7 @@ index 0000000..8c522ec
 +  }
 +
 +  transition(M, Fwd_GETX, I) {
++    d_noteOwnershipLost;
 +    // e_sendData;
 +    ee_sendDataExclusive;
 +    forward_eviction_to_cpu;
@@ -4132,6 +4180,7 @@ index 0000000..8c522ec
 +  }
 +
 +  transition(M, Fwd_GETS, O) {
++    d_noteOwnershipLost;
 +    e_sendData;
 +    l_popForwardQueue;
 +  }
@@ -4581,10 +4630,10 @@ index 0000000..8c522ec
 +}
 diff --git a/src/mem/ruby/protocol/MOESI_D-L2cache.sm b/src/mem/ruby/protocol/MOESI_D-L2cache.sm
 new file mode 100644
-index 0000000..0e72df8
+index 0000000..d63a17f
 --- /dev/null
 +++ b/src/mem/ruby/protocol/MOESI_D-L2cache.sm
-@@ -0,0 +1,3613 @@
+@@ -0,0 +1,3669 @@
 +/*
 + * Copyright (c) 2019 ARM Limited
 + * All rights reserved
@@ -4668,6 +4717,18 @@ index 0000000..0e72df8
 +  // resumes. 0 disables the gate (accept everything, as before).
 +  int d_state_min_writers := 0;
 +  int d_state_writer_epoch := 64;
++  // Change-rate gate: admit when the line's would-be ownership changes per
++  // hundred updates (GETX from a non-owner when conventional, update from a core
++  // other than the previous writer when delegated) reach d_state_min_change_pct
++  // and at least d_state_min_changes changes have been seen. The counters decay
++  // by halving every d_state_writer_epoch updates. 0 disables.
++  int d_state_min_change_pct := 0;
++  int d_state_min_changes := 2;
++  // Time-based decay of the gate table: a line idle for this many cycles
++  // restarts as single-writer (0: the update-count epoch resets the bitmap).
++  int d_state_writer_idle := 0;
++  // Per-bank adaptation of d_state_min_change_pct with a cooling-off period.
++  bool d_state_adaptive_gate := "False";
 +  // Promotion to D on distinct writers in the epoch (0: the update-count rule).
 +  int d_state_promote_writers := 0;
 +  // The terminal ACK carries the updated word (16 B response class) so the
@@ -4916,6 +4977,17 @@ index 0000000..0e72df8
 +  PerfectCacheMemory localDirectory, template="<L2Cache_DirEntry>";
 +
 +  Tick clockEdge();
++  Cycles curCycle();
++
++  // gem5 functional reads (syscall emulation) of a line whose only fresh copy
++  // is a response in flight find no readable copy; RubySystem then reads the
++  // Maybe_Stale controller with the lowest priority value. Prefer the L2 copy
++  // (20) over memory through the directory (30), as MESI_Two_Level does.
++  // Without a priority gem5 aborts the run (seen when a thread exits while
++  // another core polls its TLS line; unrelated to delegated updates).
++  int functionalReadPriority() {
++    return 20;
++  }
 +  Tick cyclesToTicks(Cycles c);
 +  void set_cache_entry(AbstractCacheEntry b);
 +  void unset_cache_entry();
@@ -5522,8 +5594,19 @@ index 0000000..0e72df8
 +          // the home has no entry for counts as single-writer: it starts owned.
 +          bool few_writers := false;
 +          if (d_state_min_writers > 0) {
-+            few_writers := dStateEngine.writersAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor)) <
-+                           d_state_min_writers;
++            few_writers := dStateEngine.writersAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor),
++                                                     curCycle(), d_state_writer_idle) < d_state_min_writers;
++          }
++          // Change-rate gate (see d_state_min_change_pct): too few would-be
++          // ownership changes, or too small a share of the line's updates.
++          if (d_state_min_change_pct > 0) {
++            int gate_pct := dStateEngine.gatePct(d_state_min_change_pct, d_state_adaptive_gate);
++            if (dStateEngine.changesAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor),
++                                          curCycle(), d_state_writer_idle) < d_state_min_changes ||
++                dStateEngine.changePct(in_msg.addr, machineIDToNodeID(in_msg.Requestor),
++                                       curCycle(), d_state_writer_idle) < gate_pct) {
++              few_writers := true;
++            }
 +          }
 +          TBE ptbe := TBEs[in_msg.addr];
 +          bool mergeable := pending && d_state_merge_limit > 0 && is_valid(ptbe) &&
@@ -5561,8 +5644,8 @@ index 0000000..0e72df8
 +            trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);
 +          } else if (dstateWouldPromote(ce, in_msg.Requestor) || st == State:D ||
 +                     (d_state_promote_writers > 0 && d_state_persistence &&
-+                      dStateEngine.writersAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor)) >=
-+                      d_state_promote_writers)) {
++                      dStateEngine.writersAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor),
++                                                curCycle(), d_state_writer_idle) >= d_state_promote_writers)) {
 +            trigger(Event:DState_Hot, in_msg.addr, ce, TBEs[in_msg.addr]);
 +          } else {
 +            trigger(Event:DState_Cold, in_msg.addr, ce, TBEs[in_msg.addr]);
@@ -6465,9 +6548,16 @@ index 0000000..0e72df8
 +  // Up to d_state_queue_depth accepted operations per L2 bank (one per line, since
 +  // the TBE is per address); reserve the executor slot and TBE/cache slot before
 +  // consuming the request. NACK is terminal non-acceptance, never a timeout or replay.
-+  action(d_noteWriter, "dwriter", desc="Record the requester in the line's distinct-writer epoch") {
++  action(d_noteWriter, "dwriter", desc="Record a rejected delegated update in the gate table") {
 +    peek(L1requestNetwork_in, RequestMsg) {
-+      dStateEngine.noteWriter(address, machineIDToNodeID(in_msg.Requestor), d_state_writer_epoch);
++      dStateEngine.noteAccess(address, machineIDToNodeID(in_msg.Requestor), curCycle(),
++                              d_state_writer_epoch, d_state_writer_idle, 0);
++    }
++  }
++  action(d_noteMigration, "dmigr", desc="Record a conventional ownership transfer in the gate table") {
++    peek(L1requestNetwork_in, RequestMsg) {
++      dStateEngine.noteAccess(address, machineIDToNodeID(in_msg.Requestor), curCycle(),
++                              d_state_writer_epoch, d_state_writer_idle, 2);
 +    }
 +  }
 +  action(d_reject, "drej", desc="Reject before application") {
@@ -6516,7 +6606,8 @@ index 0000000..0e72df8
 +        tbe.DStateMerged.orMasks(in_msg.DStateMask32, in_msg.DStateMask64);
 +      }
 +      tbe.DStateMerged.add(in_msg.Requestor, in_msg.DStateId);
-+      dStateEngine.noteWriter(address, machineIDToNodeID(in_msg.Requestor), d_state_writer_epoch);
++      dStateEngine.noteAccess(address, machineIDToNodeID(in_msg.Requestor), curCycle(),
++                              d_state_writer_epoch, d_state_writer_idle, 1);
 +    }
 +  }
 +  action(d_start, "dstart", desc="Charge service time; successive starts are spaced by the initiation interval") {
@@ -6562,7 +6653,8 @@ index 0000000..0e72df8
 +    if (cache_entry.DStateReqCount < d_state_hot_threshold) {
 +      cache_entry.DStateReqCount := cache_entry.DStateReqCount + 1;
 +    }
-+    dStateEngine.noteWriter(address, machineIDToNodeID(tbe.DStateOrig), d_state_writer_epoch);
++    dStateEngine.noteAccess(address, machineIDToNodeID(tbe.DStateOrig), curCycle(),
++                            d_state_writer_epoch, d_state_writer_idle, 1);
 +    cache_entry.DStateReadRun := 0;
 +    tbe.DStateHasOp := false;
 +  }
@@ -7045,6 +7137,7 @@ index 0000000..0e72df8
 +  // LOCAL REQUESTS SATISFIED LOCALLY
 +
 +  transition(OLSX, L1_GETX, IFLOX) {
++    d_noteMigration;
 +    i_allocateTBE;
 +    s_recordGetXL1ID;
 +    // count number of INVs needed that doesn't include requestor
@@ -7114,6 +7207,7 @@ index 0000000..0e72df8
 +  }
 +
 +  transition({ILX, ILOX}, L1_GETX, IFLOXX) {
++    d_noteMigration;
 +    kk_forwardLocalGETXToLocalExclusive;
 +    e_sendAckToL1Requestor;
 +    uu_profileMiss;
@@ -7164,6 +7258,7 @@ index 0000000..0e72df8
 +
 +
 +  transition(ILOSX, L1_GETX, IFLXO) {
++    d_noteMigration;
 +    i_allocateTBE;
 +    s_recordGetXL1ID;
 +    h_countLocalSharersExceptRequestor;
@@ -7197,6 +7292,7 @@ index 0000000..0e72df8
 +  }
 +
 +  transition(I, L1_GETX, IGM) {
++    d_noteMigration;
 +    i_allocateTBE;
 +    s_recordGetXL1ID;
 +    a_issueGETX;
@@ -7205,6 +7301,7 @@ index 0000000..0e72df8
 +  }
 +
 +  transition(S, L1_GETX, IGM) {
++    d_noteMigration;
 +    i_allocateTBE;
 +    s_recordGetXL1ID;
 +    a_issueGETX;
@@ -7216,6 +7313,7 @@ index 0000000..0e72df8
 +  }
 +
 +  transition(ILS, L1_GETX, IGMLS) {
++    d_noteMigration;
 +    i_allocateTBE;
 +    s_recordGetXL1ID;
 +    a_issueGETX;
@@ -7260,6 +7358,7 @@ index 0000000..0e72df8
 +
 +
 +  transition(ILOS, L1_GETX, IGMIO) {
++    d_noteMigration;
 +    i_allocateTBE;
 +    s_recordGetXL1ID;
 +    a_issueGETX;
@@ -7279,6 +7378,7 @@ index 0000000..0e72df8
 +  }
 +
 +  transition(OLS, L1_GETX, OGMIO) {
++    d_noteMigration;
 +    i_allocateTBE;
 +    s_recordGetXL1ID;
 +    a_issueGETX;
@@ -7297,6 +7397,7 @@ index 0000000..0e72df8
 +  }
 +
 +  transition(ILO, L1_GETX, IGMIO) {
++    d_noteMigration;
 +    i_allocateTBE;
 +    s_recordGetXL1ID;
 +    a_issueGETX;
@@ -7454,6 +7555,7 @@ index 0000000..0e72df8
 +
 +
 +  transition(SLS, L1_GETX, IGMLS) {
++    d_noteMigration;
 +    i_allocateTBE;
 +    s_recordGetXL1ID;
 +    a_issueGETX;
@@ -7482,6 +7584,7 @@ index 0000000..0e72df8
 +
 +
 +  transition(O, L1_GETX, IGMO) {
++    d_noteMigration;
 +    i_allocateTBE;
 +    s_recordGetXL1ID;
 +    a_issueGETX;
@@ -7521,6 +7624,7 @@ index 0000000..0e72df8
 +  // LOCAL REQUESTS SATISFIED DIRECTLY BY L2
 +
 +  transition(M, L1_GETX, MM) {
++    d_noteMigration;
 +    i_allocateTBE;
 +    // should count 0 of course
 +    h_countLocalSharersExceptRequestor;
@@ -8152,6 +8256,7 @@ index 0000000..0e72df8
 +    m_popRequestQueue;
 +  }
 +  transition(D, L1_GETX, MM) {
++    d_noteMigration;
 +    i_allocateTBE;
 +    h_countLocalSharersExceptRequestor;
 +    d_sendDataToL1GETX;
@@ -8200,10 +8305,10 @@ index 0000000..0e72df8
 +}
 diff --git a/src/mem/ruby/protocol/MOESI_D-dir.sm b/src/mem/ruby/protocol/MOESI_D-dir.sm
 new file mode 100644
-index 0000000..b6410d1
+index 0000000..4ef877b
 --- /dev/null
 +++ b/src/mem/ruby/protocol/MOESI_D-dir.sm
-@@ -0,0 +1,1120 @@
+@@ -0,0 +1,1130 @@
 +/*
 + * Copyright (c) 2019 ARM Limited
 + * All rights reserved
@@ -8490,6 +8595,16 @@ index 0000000..b6410d1
 +      }
 +    }
 +    return false;
++  }
++
++  // gem5 functional reads (syscall emulation) of a line whose only fresh copy
++  // is a response in flight find no readable copy; RubySystem then reads the
++  // Maybe_Stale controller with the lowest priority value. Prefer the L2 copy
++  // (20) over memory through the directory (30), as MESI_Two_Level does.
++  // Without a priority gem5 aborts the run (seen when a thread exits while
++  // another core polls its TLS line; unrelated to delegated updates).
++  int functionalReadPriority() {
++    return 30;
 +  }
 +
 +  // ** OUT_PORTS **
@@ -9667,10 +9782,10 @@ index 0000000..c2eb593
 +}
 diff --git a/src/mem/ruby/protocol/MOESI_D-msg.sm b/src/mem/ruby/protocol/MOESI_D-msg.sm
 new file mode 100644
-index 0000000..3420521
+index 0000000..2963ab3
 --- /dev/null
 +++ b/src/mem/ruby/protocol/MOESI_D-msg.sm
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,236 @@
 +/*
 + * Copyright (c) 2019 ARM Limited
 + * All rights reserved
@@ -9736,8 +9851,14 @@ index 0000000..3420521
 +  void hotWordDrop(Addr);
 +  void hotWordTouchMask(Addr, int, int, int);
 +  bool masksValid(int, int);
-+  int writersAfter(Addr, NodeID);
-+  void noteWriter(Addr, NodeID, int);
++  int writersAfter(Addr, NodeID, Cycles, int);
++  int changesAfter(Addr, NodeID, Cycles, int);
++  int changePct(Addr, NodeID, Cycles, int);
++  void noteAccess(Addr, NodeID, Cycles, int, int, int);
++  int gatePct(int, bool);
++  void noteOwnerAdd(Addr);
++  void noteOwnershipLost(Addr, Cycles);
++  int predictedTenure(Addr, Cycles, int);
 +  uint64_t nextId();
 +}
 +
@@ -9979,10 +10100,10 @@ index 848d164..f997a5a 100644
    PacketPtr pkt,             desc="Packet associated with this request";
 diff --git a/src/mem/ruby/structures/DStateEngine.hh b/src/mem/ruby/structures/DStateEngine.hh
 new file mode 100644
-index 0000000..1f44c7a
+index 0000000..338fe6e
 --- /dev/null
 +++ b/src/mem/ruby/structures/DStateEngine.hh
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,317 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Finite-capacity bank executor reference model, not a synthesized datapath.
 +// Capacity, initiation interval, service latencies and the hot-word buffer are
@@ -10048,29 +10169,84 @@ index 0000000..1f44c7a
 +class DStateEngine
 +{
 +  public:
-+    // Distinct-writer bookkeeping for the admission gate: a bounded per-bank
-+    // table (line -> bitmap of requester node ids, updates in epoch). It is kept
-+    // outside the cache entry because a line the home does not hold has no
-+    // entry, yet its rejected writers must still be counted. When the table is
-+    // full the oldest entry is dropped (that line starts as single-writer again).
-+    struct WriterEntry { std::uint64_t bits = 0; int updates = 0; std::uint64_t age = 0; };
++    // Admission-gate bookkeeping: a bounded per-bank table, line -> {bitmap of
++    // requester node ids, updates and would-be ownership changes in a decayed
++    // window, last writer, last access cycle}. It is kept outside the cache entry
++    // because a line the home does not hold has no entry, yet its rejected
++    // writers must still be counted. When the table is full the oldest entry is
++    // dropped (that line starts as single-writer again).
++    //
++    // A "change" is an access by a core other than the line's previous writer:
++    // in conventional mode that is a GETX from a non-owner (a migration); in
++    // delegated mode it is the update that would have migrated the line had it
++    // not been delegated. Counting both ways keeps the signal alive while the
++    // line is delegated, when there are no migrations to observe.
++    struct WriterEntry {
++        std::uint64_t bits = 0;
++        int epochUpdates = 0;          // updates since the bitmap last restarted
++        int updates = 0, changes = 0;  // decayed window (halved every epoch updates)
++        int lastWriter = -1;
++        std::uint64_t lastCycle = 0, age = 0;
++    };
 +    static constexpr std::size_t kWriterTable = 1024;
 +    std::unordered_map<std::uint64_t, WriterEntry> writers;
 +    std::uint64_t writerClock = 0;
++    enum AccessKind { Rejected = 0, Accepted = 1, Migration = 2 };
 +
-+    // Writers of `line` once `node` is counted (no state change).
-+    int writersAfter(std::uint64_t line, int node) const
++    // Per-bank adaptive threshold (gatePct): decisions in the current window and
++    // the mean change ratio of the rejected ones.
++    struct Adaptive {
++        int pct = -1, configured = 0, accepts = 0, rejects = 0, cooloff = 0;
++        long rejRatioSum = 0;
++    } adaptive;
++    static constexpr int kAdaptiveWindow = 1024, kAdaptiveStep = 10, kAdaptiveCooloff = 8, kAdaptiveFloor = 10;
++
++    bool expired(const WriterEntry &e, std::uint64_t now, std::uint64_t idle) const
++    {
++        return idle > 0 && now > e.lastCycle && now - e.lastCycle > idle;
++    }
++    const WriterEntry *lookup(std::uint64_t line, std::uint64_t now, std::uint64_t idle) const
 +    {
 +        auto it = writers.find(line);
-+        std::uint64_t bits = it == writers.end() ? 0 : it->second.bits;
-+        if (node >= 0 && node < 64) bits |= std::uint64_t(1) << node;
++        return it == writers.end() || expired(it->second, now, idle) ? nullptr : &it->second;
++    }
++    static int popcount(std::uint64_t bits)
++    {
 +        int n = 0;
 +        for (; bits; bits &= bits - 1) ++n;
 +        return n;
 +    }
-+    // Record one update (accepted or rejected) from `node`; every `epoch`
-+    // updates the line's bitmap restarts from this writer alone.
-+    void noteWriter(std::uint64_t line, int node, int epoch)
++    static int changePctOf(const WriterEntry &e, int node)
++    {
++        return (e.changes + (e.lastWriter != node ? 1 : 0)) * 100 / (e.updates + 1);
++    }
++
++    // Distinct writers of `line` once `node` is counted (no state change).
++    int writersAfter(std::uint64_t line, int node, std::uint64_t now, std::uint64_t idle) const
++    {
++        const WriterEntry *e = lookup(line, now, idle);
++        std::uint64_t bits = e ? e->bits : 0;
++        if (node >= 0 && node < 64) bits |= std::uint64_t(1) << node;
++        return popcount(bits);
++    }
++    // Would-be ownership changes in the window once `node`'s access is counted.
++    int changesAfter(std::uint64_t line, int node, std::uint64_t now, std::uint64_t idle) const
++    {
++        const WriterEntry *e = lookup(line, now, idle);
++        return (e ? e->changes : 0) + ((e ? e->lastWriter : -1) != node ? 1 : 0);
++    }
++    // Changes per hundred updates in the window once `node`'s access is counted.
++    int changePct(std::uint64_t line, int node, std::uint64_t now, std::uint64_t idle) const
++    {
++        const WriterEntry *e = lookup(line, now, idle);
++        return e ? changePctOf(*e, node) : 100;
++    }
++    // Record one access from `node`: a delegated update (accepted or rejected) or
++    // a conventional GETX. The bitmap restarts every `epoch` updates (idle == 0)
++    // or after `idle` quiet cycles (idle > 0); the window counters halve every
++    // `epoch` updates and clear after an idle gap, so a steadily contested line
++    // keeps a steady ratio and never bounces between modes.
++    void noteAccess(std::uint64_t line, int node, std::uint64_t now, int epoch, std::uint64_t idle, int kind)
 +    {
 +        if (writers.size() >= kWriterTable && !writers.count(line)) {
 +            auto victim = writers.begin();
@@ -10079,11 +10255,88 @@ index 0000000..1f44c7a
 +            writers.erase(victim);
 +        }
 +        WriterEntry &e = writers[line];
-+        if (++e.updates >= epoch) { e.bits = 0; e.updates = 0; }
++        if (expired(e, now, idle)) e = WriterEntry();
++        if (kind != Migration) noteDecision(kind == Accepted, changePctOf(e, node));
++        if (e.lastWriter != node) ++e.changes;
++        e.lastWriter = node;
++        if (++e.updates >= epoch) { e.updates = (e.updates + 1) / 2; e.changes = (e.changes + 1) / 2; }
++        if (idle == 0 && ++e.epochUpdates >= epoch) { e.bits = 0; e.epochUpdates = 0; }
 +        if (node >= 0 && node < 64) e.bits |= std::uint64_t(1) << node;
++        e.lastCycle = now;
 +        e.age = ++writerClock;
 +    }
 +    void forgetWriters(std::uint64_t line) { writers.erase(line); }
++
++    // Requester-side owner-tenure predictor (used by the L1): how many adds this
++    // L1 performed on a line while owning it before the line was taken away. A
++    // short last tenure means the line is contended enough that delegation beats
++    // ownership; a long one means the owner would have hit locally. This is the
++    // owner hit rate, which the home never observes. Bounded table, oldest dropped.
++    struct TenureEntry { int current = 0, last = -1; std::uint64_t lastCycle = 0, age = 0; };
++    static constexpr std::size_t kTenureTable = 1024;
++    std::unordered_map<std::uint64_t, TenureEntry> tenures;
++    std::uint64_t tenureClock = 0;
++
++    TenureEntry &tenureSlot(std::uint64_t line)
++    {
++        if (tenures.size() >= kTenureTable && !tenures.count(line)) {
++            auto victim = tenures.begin();
++            for (auto it = tenures.begin(); it != tenures.end(); ++it)
++                if (it->second.age < victim->second.age) victim = it;
++            tenures.erase(victim);
++        }
++        TenureEntry &e = tenures[line];
++        e.age = ++tenureClock;
++        return e;
++    }
++    void noteOwnerAdd(std::uint64_t line) { ++tenureSlot(line).current; }
++    void noteOwnershipLost(std::uint64_t line, std::uint64_t now)
++    {
++        TenureEntry &e = tenureSlot(line);
++        e.last = e.current;
++        e.current = 0;
++        e.lastCycle = now;
++    }
++    // The last observed tenure of `line`, or -1 when unknown or expired
++    // (idle > 0 and recorded more than idle cycles ago).
++    int predictedTenure(std::uint64_t line, std::uint64_t now, std::uint64_t idle) const
++    {
++        auto it = tenures.find(line);
++        if (it == tenures.end() || it->second.last < 0) return -1;
++        if (idle > 0 && now > it->second.lastCycle && now - it->second.lastCycle > idle) return -1;
++        return it->second.last;
++    }
++
++    // Adaptive threshold: the effective change-ratio threshold for this bank.
++    // Every kAdaptiveWindow decisions, if rejections dominate (>= 4x accepts) and
++    // the rejected requests were contested (mean ratio >= half the threshold),
++    // the threshold steps down; when accepts dominate it steps back up toward the
++    // configured value. A cooling-off period of kAdaptiveCooloff windows follows
++    // every step so an isolated burst cannot walk the threshold away.
++    int gatePct(int configured, bool enabled)
++    {
++        if (!enabled) return configured;
++        adaptive.configured = configured;
++        if (adaptive.pct < 0) adaptive.pct = configured;
++        return adaptive.pct;
++    }
++    void noteDecision(bool accepted, int ratio)
++    {
++        if (adaptive.pct < 0) return;    // adaptation off or not yet queried
++        if (accepted) ++adaptive.accepts; else { ++adaptive.rejects; adaptive.rejRatioSum += ratio; }
++        if (adaptive.accepts + adaptive.rejects < kAdaptiveWindow) return;
++        if (adaptive.cooloff > 0) {
++            --adaptive.cooloff;
++        } else if (adaptive.rejects >= 4 * adaptive.accepts && adaptive.rejects > 0 &&
++                   adaptive.rejRatioSum / adaptive.rejects >= adaptive.pct / 2 &&
++                   adaptive.pct - kAdaptiveStep >= kAdaptiveFloor) {
++            adaptive.pct -= kAdaptiveStep; adaptive.cooloff = kAdaptiveCooloff;
++        } else if (adaptive.accepts >= 4 * adaptive.rejects && adaptive.pct < adaptive.configured) {
++            adaptive.pct = std::min(adaptive.configured, adaptive.pct + kAdaptiveStep);
++            adaptive.cooloff = kAdaptiveCooloff;
++        }
++        adaptive.accepts = adaptive.rejects = 0; adaptive.rejRatioSum = 0;
++    }
 +    // One request's own masks must not claim a byte at both widths.
 +    bool masksValid(int m32, int m64) const
 +    {

@@ -6,6 +6,20 @@ by [`paper/MOESI-D Paper.pdf`](../paper/MOESI-D%20Paper.pdf). The PDF is kept
 unchanged because that DOI points to it. This page lists what in it no longer
 holds, what changed in the implementation, and where the current evidence is.
 
+## Round 7 (2026-10-02): admission by owner hit rate
+
+The distinct-writer gate of round 6 could not separate shared lines where the
+owner still wins (the Count-Min sketch at 4 cores) from shared lines where
+delegation wins (512 scattered lines): both show four writers. Two admission
+mechanisms that estimate the owner's hit rate replace it as the primary signal
+(the writer gate stays as a knob); see `docs/ARCHITECTURE.md` §4a and the round-7
+section of `results/ABLATION_2026-09-30.md`. A gem5 simulation-infrastructure
+fix came with it: the L2 and directory controllers now declare a functional-read
+priority, so a syscall-emulation read of a line whose only fresh copy is in
+flight reads the L2 copy or memory instead of aborting the run (observed at
+thread exit while another core polls the exiting thread's TLS line; unrelated to
+delegated updates).
+
 ## Corrections to the v1.0.0 paper
 
 1. **Software transparency.** v1.0.0 redirected ordinary x86 `LOCK ADD`. The
