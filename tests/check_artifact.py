@@ -42,7 +42,7 @@ class ArtifactChecks(unittest.TestCase):
         self.assertNotIn("deallocate", nack)
         issue = l1.split("transition(I, DStateReq_CPU, D_REQ)", 1)[1].split("}", 1)[0]
         self.assertNotIn("complete", issue.lower())
-        self.assertIn("sequencer.atomicRemoteCallback(address)", l1)
+        self.assertIn("sequencer.atomicRemoteCallback(address, value, in_msg.HasValue)", l1)
         l2 = (ROOT / "protocol/MOESI_D-L2cache.sm").read_text()
         self.assertIn("d_apply; d_ack; d_finish", l2)
         self.assertIn("cache_entry.Sharers.count() == 0", l2)
@@ -142,6 +142,22 @@ class ArtifactChecks(unittest.TestCase):
         i = l2.index("d_state_evict_for_delegate) {")
         self.assertIn("trigger(Event:L2_Replacement, victim", l2[i:i + 400])
         self.assertIn("trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);", l2[i:i + 700])
+
+
+    def test_round6_gate_ackvalue_and_sameline_guards(self):
+        """Round 6: the gate rejects before acceptance and records writers on both
+        paths; the ACK value completes only loads inside the add's own word; the
+        TSO same-line rule holds the in-flight slot until every batched add
+        completes."""
+        l2 = (ROOT / "protocol/MOESI_D-L2cache.sm").read_text(encoding="utf-8")
+        self.assertIn("} else if (few_writers) {", l2)
+        self.assertIn("d_noteWriter;", l2)
+        self.assertIn("dStateEngine.writersAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor)) <", l2)
+        self.assertIn("dStateEngine.noteWriter(address, machineIDToNodeID(tbe.DStateOrig), d_state_writer_epoch);", l2)
+        seq = (ROOT / "protocol/ruby-integration.patch").read_text(encoding="utf-8")
+        self.assertIn("requests.front().pkt->getAddr() + requests.front().pkt->getSize() <= word_hi", seq)
+        self.assertIn("storeInFlight = inFlightAtomics > 0;", seq)
+        self.assertIn("(e.request()->mainReq()->getPaddr() & cacheBlockMask) == inFlightAtomicLine", seq)
 
 
 if __name__ == "__main__":

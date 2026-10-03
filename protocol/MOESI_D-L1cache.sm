@@ -1060,7 +1060,12 @@ machine(MachineType:L1Cache, "L1 cache protocol")
   }
 
   action(camo_completeDelegated, "camo", desc="Complete an already-applied remote atomic without executing it twice") {
-    sequencer.atomicRemoteCallback(address);
+    peek(responseToL1Cache_in, ResponseMsg) {
+      // With d_state_ack_value the ACK carries the updated word; the sequencer
+      // completes a load of that word waiting behind the add from it.
+      DataBlock value := in_msg.DataBlk;
+      sequencer.atomicRemoteCallback(address, value, in_msg.HasValue);
+    }
   }
 
   action(d_checkResponseId, "dcheckid", desc="Reject stale or mismatched terminal responses") {

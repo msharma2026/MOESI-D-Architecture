@@ -14,6 +14,7 @@
 #include <limits>
 #include <ostream>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 namespace gem5::ruby
@@ -62,6 +63,42 @@ inline void dstateAddMasked(std::uint8_t *data, const std::uint8_t *operand,
 class DStateEngine
 {
   public:
+    // Distinct-writer bookkeeping for the admission gate: a bounded per-bank
+    // table (line -> bitmap of requester node ids, updates in epoch). It is kept
+    // outside the cache entry because a line the home does not hold has no
+    // entry, yet its rejected writers must still be counted. When the table is
+    // full the oldest entry is dropped (that line starts as single-writer again).
+    struct WriterEntry { std::uint64_t bits = 0; int updates = 0; std::uint64_t age = 0; };
+    static constexpr std::size_t kWriterTable = 1024;
+    std::unordered_map<std::uint64_t, WriterEntry> writers;
+    std::uint64_t writerClock = 0;
+
+    // Writers of `line` once `node` is counted (no state change).
+    int writersAfter(std::uint64_t line, int node) const
+    {
+        auto it = writers.find(line);
+        std::uint64_t bits = it == writers.end() ? 0 : it->second.bits;
+        if (node >= 0 && node < 64) bits |= std::uint64_t(1) << node;
+        int n = 0;
+        for (; bits; bits &= bits - 1) ++n;
+        return n;
+    }
+    // Record one update (accepted or rejected) from `node`; every `epoch`
+    // updates the line's bitmap restarts from this writer alone.
+    void noteWriter(std::uint64_t line, int node, int epoch)
+    {
+        if (writers.size() >= kWriterTable && !writers.count(line)) {
+            auto victim = writers.begin();
+            for (auto it = writers.begin(); it != writers.end(); ++it)
+                if (it->second.age < victim->second.age) victim = it;
+            writers.erase(victim);
+        }
+        WriterEntry &e = writers[line];
+        if (++e.updates >= epoch) { e.bits = 0; e.updates = 0; }
+        if (node >= 0 && node < 64) e.bits |= std::uint64_t(1) << node;
+        e.age = ++writerClock;
+    }
+    void forgetWriters(std::uint64_t line) { writers.erase(line); }
     // One request's own masks must not claim a byte at both widths.
     bool masksValid(int m32, int m64) const
     {

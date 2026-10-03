@@ -131,6 +131,18 @@ ROI instrumentation and performance acceptance criteria.
 | `DSTATE_RANGE_LO_MB` / `_HI_MB` | 0 / 0 | When hi > lo, only adds to virtual addresses in [lo MB, hi MB) are delegated (static placement for oracle runs) |
 | `DSTATE_MAX_OUTSTANDING` | 16 | Per-core outstanding Ruby requests (gem5 default); applies to every mode |
 | `DSTATE_EVICT_FOR_DELEGATE` | 0 | 1: a delegated request to a line the home does not hold, in a full set, evicts a victim (as an L1 GETX does) instead of being rejected |
+| `DSTATE_MIN_WRITERS` / `DSTATE_WRITER_EPOCH` | 0 / 64 | Admission gate: accept a delegated update only once this many distinct cores have written the line in the current epoch of updates; otherwise reject it and the requester owns the line. 0 disables |
+| `DSTATE_PROMOTE_WRITERS` | 0 | Promote to D once this many distinct writers are seen in the epoch (0: the update-count rule) |
+| `DSTATE_ACK_VALUE` | 0 | 1: the terminal ACK carries the updated word (16 B response); a load of that word waiting behind the add completes from it |
+| `DSTATE_TSO_SAMELINE` | 0 | 1 (O3 only): under TSO a younger no-return add to the same line may issue while older ones are in flight; the home applies the batch atomically, stores to other lines wait for all of them |
+
+Recommended set after the 2026-10 ablations: the `full` executor knobs (`DSTATE_QUEUE_DEPTH=16
+DSTATE_INIT_INTERVAL=4 DSTATE_BUSY_STALL=1 DSTATE_QUEUE_STALL=1`), `DSTATE_REQ_COMBINE=16
+DSTATE_MERGE_LIMIT=64 DSTATE_HOTWORDS=32 DSTATE_HIT_LATENCY=4 DSTATE_FAR_READS=1
+DSTATE_READ_DOWNGRADE=64 DSTATE_EVICT_FOR_DELEGATE=1 DSTATE_DELTA_MIN_WORDS=2`, plus
+`DSTATE_TSO_SAMELINE=1` under TSO or `DSTATE_RELAXED_AMO=1` under relaxed ordering, and
+`DSTATE_MIN_WRITERS` set below the core count (3 at 4 cores, 6 at 16) when single-writer
+lines may be delegated. The defaults stay at the conservative as-shipped values.
 | `DSTATE_BUFFER_SIZE` | 32 | Entries per configured endpoint/trigger buffer |
 | `DSTATE_TBES` | 16 | L1/L2 controller TBE count |
 | `DSTATE_THRESHOLD` | 4 | Saturating accepted-update count needed for promotion |

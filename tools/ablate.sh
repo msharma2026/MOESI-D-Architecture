@@ -486,6 +486,83 @@ v5)
     MODES=$PERF3 matrix E1_multi8192_T4_evict scatter_multi "4 125 8192" 4 X86O3CPU $KN_T4 DSTATE_EVICT_FOR_DELEGATE=1 &
     wait ;;
   esac ;;
+v6)
+  # Round six: admission gate (distinct writers, epoch decay), promotion on writers,
+  # ACK-with-value, TSO same-line batching. Columns add to the round-4 knob sets:
+  #   G  = gate (MIN_WRITERS=6, epoch 64)   S = TSO same-line batching   V = ACK value
+  #   usage: ablate.sh v6 gates|strict|reads|regress16|all
+  KN_V3="DSTATE_QUEUE_DEPTH=16 DSTATE_INIT_INTERVAL=4 DSTATE_BUSY_STALL=1 DSTATE_QUEUE_STALL=1 DSTATE_REQ_COMBINE=16 DSTATE_MERGE_LIMIT=64"
+  FAR="DSTATE_FAR_READS=1 DSTATE_READ_DOWNGRADE=64 DSTATE_EVICT_FOR_DELEGATE=1"
+  KN_T4="$KN_V3 DSTATE_EXEC_LATENCY=20 $FAR"
+  KN_TH4="$KN_V3 DSTATE_HOTWORDS=32 DSTATE_HIT_LATENCY=4 $FAR"
+  KN_R4="$KN_TH4 DSTATE_RELAXED_AMO=1 DSTATE_DELTA_MIN_WORDS=2"
+  GATE="DSTATE_MIN_WRITERS=6 DSTATE_WRITER_EPOCH=64"
+  GATE2="DSTATE_MIN_WRITERS=2 DSTATE_WRITER_EPOCH=16"
+  GATE3="DSTATE_MIN_WRITERS=3 DSTATE_WRITER_EPOCH=64"
+  SL="DSTATE_TSO_SAMELINE=1 DSTATE_DELTA_MIN_WORDS=2"
+  ACKV="DSTATE_ACK_VALUE=1"
+  PW="DSTATE_PROMOTE_WRITERS=2"
+  PERF3="local,remote,persistent"
+  BUF16="DSTATE_BUFFER_SIZE=256"
+  case ${2:-all} in
+  gates)
+    matrix G30_regress_TH4_SGV_o3     coherence_regression        "" 5 X86O3CPU    $KN_TH4 $GATE2 $SL $ACKV $PW &
+    matrix G31_regress_TH4_SGV_minor  coherence_regression        "" 5 X86MinorCPU $KN_TH4 $GATE2 $ACKV $PW &
+    matrix G32_regress_R4_GV_fenced   coherence_regression_fenced "" 5 X86O3CPU    $KN_R4  $GATE2 $ACKV $PW &
+    matrix G33_regress_T4_S_o3        coherence_regression        "" 5 X86O3CPU    $KN_T4  $SL &
+    wait
+    # TSO litmus with same-line batching must pass; litmus2 exercises the rule directly
+    litmus L40_litmus_unfenced_T4_S          ordering_litmus         DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_T4 $SL &
+    litmus L41_litmus2_unfenced_T4_S         ordering_litmus2        DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_T4 $SL &
+    litmus L42_litmus2_unfenced_T4_noS       ordering_litmus2        DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_T4 &
+    litmus L43_litmus2_unfenced_T4_S_local   ordering_litmus2        DSTATE_ENABLED=0 DSTATE_PERSISTENCE=0 $KN_T4 $SL &
+    litmus L44_litmus_unfenced_T4_SGV        ordering_litmus         DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_TH4 $GATE2 $SL $ACKV $PW &
+    litmus L45_litmus2_fenced_R4_V           ordering_litmus2_fenced DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_R4 $ACKV &
+    wait ;;
+  strict)
+    # the strict-ordering single-line losses: hot key, 32-counter line, CMS at 4 cores
+    MODES=$PERF3 matrix U0_hotkey800k_TH4_S        scatter_dstate "4 200000 1"  4 X86O3CPU $KN_TH4 $SL &
+    MODES=$PERF3 matrix U1_hotkey800k_TH4_G        scatter_dstate "4 200000 1"  4 X86O3CPU $KN_TH4 $GATE &
+    MODES=$PERF3 matrix U2_hotkey800k_TH4_SG       scatter_dstate "4 200000 1"  4 X86O3CPU $KN_TH4 $SL $GATE &
+    MODES=$PERF3 matrix U3_scatter800k_TH4_S       scatter_dstate "4 200000 32" 4 X86O3CPU $KN_TH4 $SL &
+    wait
+    MODES=$PERF3 matrix U4_scatter800k_T4_S        scatter_dstate "4 200000 32" 4 X86O3CPU $KN_T4 $SL &
+    MODES=$PERF3 matrix U5_cms_T4_SG               cms_dstate     "4 20000"     4 X86O3CPU $KN_T4 $SL $GATE &
+    MODES=$PERF3 matrix U6_cms_T4_G                cms_dstate     "4 20000"     4 X86O3CPU $KN_T4 $GATE &
+    MODES=$PERF3 matrix U7_multi512_T4_SG          scatter_multi  "4 2000 512"  4 X86O3CPU $KN_T4 $SL $GATE &
+    wait
+    MODES=$PERF3 matrix U8_hotkey800k_8c_TH4_SG    scatter_dstate "8 100000 1"  8 X86O3CPU $KN_TH4 $SL $GATE &
+    MODES=$PERF3 matrix U9_multi512_R4_G           scatter_multi  "4 2000 512"  4 X86O3CPU $KN_R4 $GATE &
+    MODES=$PERF3 matrix U10_hotkey800k_R4_G        scatter_dstate "4 200000 1"  4 X86O3CPU $KN_R4 $GATE &
+    wait
+    # a gate of 3 admits every 4-writer line at 4 cores: what it costs CMS and what it keeps
+    MODES=$PERF3 matrix U12_multi512_T4_SG3        scatter_multi  "4 2000 512"  4 X86O3CPU $KN_T4 $SL $GATE3 &
+    MODES=$PERF3 matrix U13_cms_T4_SG3             cms_dstate     "4 20000"     4 X86O3CPU $KN_T4 $SL $GATE3 &
+    MODES=$PERF3 matrix U14_hotkey800k_TH4_SG3     scatter_dstate "4 200000 1"  4 X86O3CPU $KN_TH4 $SL $GATE3 &
+    wait ;;
+  reads)
+    # read-after-add under strict ordering: ACK value, promotion on writers, batching
+    MODES=$PERF3 matrix V0_rw800k_T4_V             scatter_rw "4 200000 32 8" 4 X86O3CPU $KN_T4 $ACKV &
+    MODES=$PERF3 matrix V1_rw800k_T4_VP            scatter_rw "4 200000 32 8" 4 X86O3CPU $KN_T4 $ACKV $PW &
+    MODES=$PERF3 matrix V2_rw800k_T4_SVP           scatter_rw "4 200000 32 8" 4 X86O3CPU $KN_T4 $SL $ACKV $PW &
+    MODES=$PERF3 matrix V3_rw800k_R4_V             scatter_rw "4 200000 32 8" 4 X86O3CPU $KN_R4 $ACKV &
+    wait
+    export TIMEOUT=7200
+    MODES=$PERF3 matrix V4_rw800k_16c_T4_SVP       scatter_rw "16 50000 32 8" 16 X86O3CPU $KN_T4 $SL $ACKV $PW $BUF16 &
+    MODES=$PERF3 matrix V5_rw800k_16c_R4_V         scatter_rw "16 50000 32 8" 16 X86O3CPU $KN_R4 $ACKV $BUF16 &
+    wait ;;
+  regress16)
+    # the gate must not cost the 16-core wins
+    export TIMEOUT=7200
+    MODES=$PERF3 matrix W16_hotkey800k_16c_TH4_SG  scatter_dstate "16 50000 1"  16 X86O3CPU $KN_TH4 $SL $GATE $BUF16 &
+    MODES=$PERF3 matrix W17_multi512_16c_R4_G      scatter_multi  "16 500 512"  16 X86O3CPU $KN_R4 $GATE $BUF16 &
+    wait
+    MODES=$PERF3 matrix W18_phased512_16c_R4_GV    scatter_phased "16 25 512 8" 16 X86O3CPU $KN_R4 $GATE $ACKV $BUF16 &
+    MODES=$PERF3 matrix W19_hotkey800k_16c_R4_G    scatter_dstate "16 50000 1"  16 X86O3CPU $KN_R4 $GATE $BUF16 &
+    wait ;;
+  all)
+    for ph in gates strict reads regress16; do echo "--- $ph $(date +%H:%M)"; bash "$0" v6 $ph; done ;;
+  esac ;;
 report)
   # One row per (run, mode). Update/response message counts come from the L1's terminal
   # ACK/NACK counters (Garnet emits no per-size-class msg_count); newBytes uses the derived

@@ -73,6 +73,19 @@ machine(MachineType:L2Cache, "Token protocol")
   // a victim (as an L1 GETX does) instead of rejecting into a migration. Default
   // off (reject, as shipped).
   bool d_state_evict_for_delegate := "False";
+  // Admission gate: accept a delegated update only once at least min_writers
+  // DISTINCT cores have written the line in the current epoch (writer_epoch
+  // updates, accepted or rejected); otherwise reject it, and the requester takes
+  // the line by the ordinary GETX path and owns it. The epoch gives the exit: a
+  // line that goes quiet or single-writer is rejected again and ownership
+  // resumes. 0 disables the gate (accept everything, as before).
+  int d_state_min_writers := 0;
+  int d_state_writer_epoch := 64;
+  // Promotion to D on distinct writers in the epoch (0: the update-count rule).
+  int d_state_promote_writers := 0;
+  // The terminal ACK carries the updated word (16 B response class) so the
+  // requester can complete a load of that word that is waiting behind the add.
+  bool d_state_ack_value := "False";
   //   hit_latency   service time when the target word is in the bank's hot-word
   //                 buffer (registers, not the SRAM array); default = full latency
   //   hotwords      hot-word buffer entries per bank; 0 disables the model
@@ -337,6 +350,9 @@ machine(MachineType:L2Cache, "Token protocol")
 
   bool dstateWouldPromote(Entry ce, MachineID req) {
     if (d_state_persistence == false || is_invalid(ce)) { return false; }
+    // With d_state_promote_writers the in_port decides on the writer bitmap
+    // (it can see the engine helpers); this count rule is then unused.
+    if (d_state_promote_writers > 0) { return false; }
     if (ce.DStateReqCount + 1 < d_state_hot_threshold) { return false; }
     return ce.DStateMultipleRequesters ||
            (ce.DStateSeenRequester && ce.DStateFirstRequester != req);
@@ -915,6 +931,13 @@ machine(MachineType:L2Cache, "Token protocol")
           // absorb this update. Addition is associative, so one read-modify-write
           // with the summed operand is exact; the requester is recorded and gets
           // its own terminal ACK. No executor slot or TBE is consumed.
+          // Admission gate on distinct writers (see d_state_min_writers). A line
+          // the home has no entry for counts as single-writer: it starts owned.
+          bool few_writers := false;
+          if (d_state_min_writers > 0) {
+            few_writers := dStateEngine.writersAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor)) <
+                           d_state_min_writers;
+          }
           TBE ptbe := TBEs[in_msg.addr];
           bool mergeable := pending && d_state_merge_limit > 0 && is_valid(ptbe) &&
                             ptbe.DStateHasOp &&
@@ -928,6 +951,8 @@ machine(MachineType:L2Cache, "Token protocol")
             trigger(Event:DState_Merge, in_msg.addr, ce, TBEs[in_msg.addr]);
           } else if (busy && d_state_busy_stall) {
             trigger(Event:DState_Busy, in_msg.addr, ce, TBEs[in_msg.addr]);
+          } else if (few_writers) {
+            trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);
           } else if (owner_ok && d_state_queue_stall &&
                      dStateEngine.hasCapacity(d_state_queue_depth) == false) {
             trigger(Event:DState_Full, in_msg.addr, ce, TBEs[in_msg.addr]);
@@ -947,7 +972,10 @@ machine(MachineType:L2Cache, "Token protocol")
             trigger(Event:L2_Replacement, victim, getCacheEntry(victim), TBEs[victim]);
           } else if (is_invalid(ce) && L2cache.cacheAvail(in_msg.addr) == false) {
             trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);
-          } else if (dstateWouldPromote(ce, in_msg.Requestor) || st == State:D) {
+          } else if (dstateWouldPromote(ce, in_msg.Requestor) || st == State:D ||
+                     (d_state_promote_writers > 0 && d_state_persistence &&
+                      dStateEngine.writersAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor)) >=
+                      d_state_promote_writers)) {
             trigger(Event:DState_Hot, in_msg.addr, ce, TBEs[in_msg.addr]);
           } else {
             trigger(Event:DState_Cold, in_msg.addr, ce, TBEs[in_msg.addr]);
@@ -1850,6 +1878,11 @@ machine(MachineType:L2Cache, "Token protocol")
   // Up to d_state_queue_depth accepted operations per L2 bank (one per line, since
   // the TBE is per address); reserve the executor slot and TBE/cache slot before
   // consuming the request. NACK is terminal non-acceptance, never a timeout or replay.
+  action(d_noteWriter, "dwriter", desc="Record the requester in the line's distinct-writer epoch") {
+    peek(L1requestNetwork_in, RequestMsg) {
+      dStateEngine.noteWriter(address, machineIDToNodeID(in_msg.Requestor), d_state_writer_epoch);
+    }
+  }
   action(d_reject, "drej", desc="Reject before application") {
     peek(L1requestNetwork_in, RequestMsg) {
       enqueue(responseNetwork_out, ResponseMsg, response_latency) {
@@ -1896,6 +1929,7 @@ machine(MachineType:L2Cache, "Token protocol")
         tbe.DStateMerged.orMasks(in_msg.DStateMask32, in_msg.DStateMask64);
       }
       tbe.DStateMerged.add(in_msg.Requestor, in_msg.DStateId);
+      dStateEngine.noteWriter(address, machineIDToNodeID(in_msg.Requestor), d_state_writer_epoch);
     }
   }
   action(d_start, "dstart", desc="Charge service time; successive starts are spaced by the initiation interval") {
@@ -1941,6 +1975,7 @@ machine(MachineType:L2Cache, "Token protocol")
     if (cache_entry.DStateReqCount < d_state_hot_threshold) {
       cache_entry.DStateReqCount := cache_entry.DStateReqCount + 1;
     }
+    dStateEngine.noteWriter(address, machineIDToNodeID(tbe.DStateOrig), d_state_writer_epoch);
     cache_entry.DStateReadRun := 0;
     tbe.DStateHasOp := false;
   }
@@ -1955,6 +1990,12 @@ machine(MachineType:L2Cache, "Token protocol")
       out_msg.SenderMachine := MachineType:L2Cache;
       out_msg.DStateId := tbe.DStateId;
       out_msg.MessageSize := MessageSizeType:DState_Response;
+      if (d_state_ack_value) {
+        // the updated word rides in the ACK: 8 B status + 8 B value, one flit
+        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.HasValue := true;
+        out_msg.MessageSize := MessageSizeType:DState_ResponseData;
+      }
     }
   }
   action(d_finish, "dfinish", desc="Release the executor after the ACK was queued") {
@@ -1987,6 +2028,11 @@ machine(MachineType:L2Cache, "Token protocol")
       out_msg.SenderMachine := MachineType:L2Cache;
       out_msg.DStateId := tbe.DStateMerged.id(tbe.DStateMerged.count() - 1);
       out_msg.MessageSize := MessageSizeType:DState_Response;
+      if (d_state_ack_value) {
+        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.HasValue := true;
+        out_msg.MessageSize := MessageSizeType:DState_ResponseData;
+      }
     }
     tbe.DStateMerged.popBack();
   }
@@ -3359,6 +3405,7 @@ machine(MachineType:L2Cache, "Token protocol")
 
   // Rejection is available in every state and never allocates or mutates data.
   transition({I, ILS, ILX, ILO, ILOX, ILOS, ILOSX, S, O, OLS, OLSX, SLS, M, D, IGDX, IGDXO, IGD_P, DX_DRAIN, D_EXEC_M, D_EXEC_D, D_ACKING_M, D_ACKING_D, IFGX, IFGS, ISFGS, IFGXX, IFGXXD, OLSF, ILOW, ILOXW, ILOSW, ILOSXW, ILSW, IW, ILXW, SLSW, OLSW, OW, SW, OXW, OLSXW, IFLS, IFLO, IFLOX, IFLOXX, IFLOSX, IFLXO, IGS, IGM, IGMLS, IGMO, IGMOU, IGMIO, OGMIO, IGMIOF, IGMIOFD, IGMIOFS, OGMIOF, II, MM, SS, OO, OLSS, OLSXS, SLSS, OI, MI, MII, OLSI, ILSI, ILOSD, ILOSXD, ILOD, ILXD, ILOXD}, DState_Reject) {
+    d_noteWriter;
     d_reject;
     o_popL1RequestQueue;
   }

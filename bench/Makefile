@@ -22,7 +22,7 @@ CMS     := cms_dstate cms_naive cms_priv cms_privstream
 # The AADD instruction itself is unfenced (ordered as a store under TSO). The
 # *_fenced builds wrap every AADD in mfence via -DDSTATE_FENCED, reproducing the
 # earlier always-fenced macro-op as an ablation column with the same simulator.
-ORDER   := ordering_litmus ordering_litmus_fenced ordering_litmus_lockadd
+ORDER   := ordering_litmus ordering_litmus_fenced ordering_litmus_lockadd ordering_litmus2 ordering_litmus2_fenced
 FENCED  := scatter_dstate_fenced scatter_rw_fenced coherence_regression_fenced
 
 all: $(DSTATE) $(BASE) $(LITMUS) $(CMS) $(ORDER) $(FENCED) coherence_regression
@@ -36,6 +36,8 @@ coherence_regression_fenced: coherence_regression.c ; $(CC) $(CPPFLAGS) $(CFLAGS
 ordering_litmus:         ordering_litmus.c ; $(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDLIBS)
 ordering_litmus_fenced:  ordering_litmus.c ; $(CC) $(CPPFLAGS) $(CFLAGS) -DDSTATE_FENCED $< -o $@ $(LDLIBS)
 ordering_litmus_lockadd: ordering_litmus.c ; $(CC) $(CPPFLAGS) $(CFLAGS) -DLITMUS_LOCK_ADD $< -o $@ $(LDLIBS)
+ordering_litmus2:        ordering_litmus2.c ; $(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDLIBS)
+ordering_litmus2_fenced: ordering_litmus2.c ; $(CC) $(CPPFLAGS) $(CFLAGS) -DDSTATE_FENCED $< -o $@ $(LDLIBS)
 scatter_dstate_fenced:   scatter_bench.c   ; $(CC) $(CPPFLAGS) $(CFLAGS) -DDSTATE_FENCED $< -o $@ $(LDLIBS)
 scatter_rw_fenced:       scatter_rw.c      ; $(CC) $(CPPFLAGS) $(CFLAGS) -DDSTATE_FENCED $< -o $@ $(LDLIBS)
 

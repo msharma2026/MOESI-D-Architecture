@@ -130,12 +130,22 @@ def create_system(
     # O3 only: no-return atomics bypass TSO's one-store-in-flight rule (Intel
     # RAO-INT's weakly ordered contract). Software fences where it publishes.
     relaxed_amo = flag_env("DSTATE_RELAXED_AMO", "0")
+    # TSO same-line batching of no-return adds (O3 only; legal under TSO).
+    tso_sameline = flag_env("DSTATE_TSO_SAMELINE", "0")
+    # Admission gate on distinct writers, its epoch, promotion on writers, ACK value.
+    min_writers = bounded_env("DSTATE_MIN_WRITERS", "0", 0, 64)
+    writer_epoch = bounded_env("DSTATE_WRITER_EPOCH", "64", 1, 1 << 20)
+    promote_writers = bounded_env("DSTATE_PROMOTE_WRITERS", "0", 0, 64)
+    ack_value = flag_env("DSTATE_ACK_VALUE", "0")
     for cpu in cpus:
         try:
             cpu.relaxedNoReturnAtomics = relaxed_amo
+            cpu.tsoSameLineAtomics = tso_sameline
         except AttributeError:
             if relaxed_amo:
                 raise ValueError("DSTATE_RELAXED_AMO requires X86O3CPU")
+            if tso_sameline:
+                raise ValueError("DSTATE_TSO_SAMELINE requires X86O3CPU")
 
     cpu_sequencers = []
 
@@ -265,6 +275,10 @@ def create_system(
             d_state_queue_stall=queue_stall,
             d_state_far_reads=far_reads,
             d_state_evict_for_delegate=evict_for_delegate,
+            d_state_min_writers=min_writers,
+            d_state_writer_epoch=writer_epoch,
+            d_state_promote_writers=promote_writers,
+            d_state_ack_value=ack_value,
             d_state_hit_latency=hit_latency,
             d_state_hotwords=hotwords,
             d_state_merge_limit=merge_limit,

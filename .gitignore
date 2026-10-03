@@ -15,6 +15,11 @@ bench/spmv_dstate
 bench/spmv_base
 bench/coherence_regression
 bench/litmus_*
+bench/ordering_litmus
+bench/ordering_litmus_fenced
+bench/ordering_litmus_lockadd
+bench/ordering_litmus2
+bench/ordering_litmus2_fenced
 bench/cms_*
 !bench/litmus_bench.c
 !bench/cms_bench.c

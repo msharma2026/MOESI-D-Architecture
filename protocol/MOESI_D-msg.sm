@@ -63,6 +63,8 @@ structure(DStateEngine, external="yes") {
   void hotWordDrop(Addr);
   void hotWordTouchMask(Addr, int, int, int);
   bool masksValid(int, int);
+  int writersAfter(Addr, NodeID);
+  void noteWriter(Addr, NodeID, int);
   uint64_t nextId();
 }
 
@@ -200,6 +202,7 @@ structure(ResponseMsg, desc="...", interface="Message") {
   int Acks,                    desc="How many acks to expect";
   MessageSizeType MessageSize, desc="size category of the message";
   uint64_t DStateId, default="0", desc="Correlates terminal delegated completion/rejection";
+  bool HasValue, default="false", desc="DSTATE_ACK carries the updated word in DataBlk (16 B response)";
 
   bool functionalRead(Packet *pkt) {
     // Read only those messages that contain the data

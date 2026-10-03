@@ -1,9 +1,9 @@
 diff --git a/bench/Makefile b/bench/Makefile
 new file mode 100644
-index 0000000..9cba908
+index 0000000..13b2ea8
 --- /dev/null
 +++ b/bench/Makefile
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,86 @@
 +# Benchmarks for MOESI-D evaluation.
 +#
 +# Built statically for x86-64 gem5 SE mode. Scatter/SpMV use OpenMP;
@@ -28,7 +28,7 @@ index 0000000..9cba908
 +# The AADD instruction itself is unfenced (ordered as a store under TSO). The
 +# *_fenced builds wrap every AADD in mfence via -DDSTATE_FENCED, reproducing the
 +# earlier always-fenced macro-op as an ablation column with the same simulator.
-+ORDER   := ordering_litmus ordering_litmus_fenced ordering_litmus_lockadd
++ORDER   := ordering_litmus ordering_litmus_fenced ordering_litmus_lockadd ordering_litmus2 ordering_litmus2_fenced
 +FENCED  := scatter_dstate_fenced scatter_rw_fenced coherence_regression_fenced
 +
 +all: $(DSTATE) $(BASE) $(LITMUS) $(CMS) $(ORDER) $(FENCED) coherence_regression
@@ -42,6 +42,8 @@ index 0000000..9cba908
 +ordering_litmus:         ordering_litmus.c ; $(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDLIBS)
 +ordering_litmus_fenced:  ordering_litmus.c ; $(CC) $(CPPFLAGS) $(CFLAGS) -DDSTATE_FENCED $< -o $@ $(LDLIBS)
 +ordering_litmus_lockadd: ordering_litmus.c ; $(CC) $(CPPFLAGS) $(CFLAGS) -DLITMUS_LOCK_ADD $< -o $@ $(LDLIBS)
++ordering_litmus2:        ordering_litmus2.c ; $(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDLIBS)
++ordering_litmus2_fenced: ordering_litmus2.c ; $(CC) $(CPPFLAGS) $(CFLAGS) -DDSTATE_FENCED $< -o $@ $(LDLIBS)
 +scatter_dstate_fenced:   scatter_bench.c   ; $(CC) $(CPPFLAGS) $(CFLAGS) -DDSTATE_FENCED $< -o $@ $(LDLIBS)
 +scatter_rw_fenced:       scatter_rw.c      ; $(CC) $(CPPFLAGS) $(CFLAGS) -DDSTATE_FENCED $< -o $@ $(LDLIBS)
 +
@@ -973,6 +975,108 @@ index 0000000..361d4be
 +    puts(bad ? "FAIL" : "PASS: no younger store observed before an older add");
 +    return bad;
 +}
+diff --git a/bench/ordering_litmus2.c b/bench/ordering_litmus2.c
+new file mode 100644
+index 0000000..ca52135
+--- /dev/null
++++ b/bench/ordering_litmus2.c
+@@ -0,0 +1,96 @@
++/* Same-line store-order litmus for the TSO same-line batching rule.
++ *
++ * The rule lets a younger no-return add to the SAME line leave the store queue
++ * while an older add is in flight; stores to any other line still wait for all
++ * of them. TSO requires that no observer see a younger store before an older
++ * one. Two variants, 2 hardware contexts (main thread writes):
++ *
++ *   1  writer: add X; add X2 (same line, different word); store FLAG (other line)
++ *      reader: wait FLAG == round; X >= round and X2 >= round must both hold
++ *   2  writer: add X; add X (same word, twice); store FLAG (other line)
++ *      reader: wait FLAG == round; X >= 2*round must hold
++ *
++ * forbidden counts any observation of the flag with an add not yet visible.
++ * Build with -DDSTATE_FENCED to put mfence around each add (control). */
++#include "dstate_ops.h"
++#include <pthread.h>
++#include <string.h>
++#define LINE 128
++#define LINES 8
++#ifndef LITMUS_ROUNDS
++#define LITMUS_ROUNDS 20000u
++#endif
++static uint32_t cells[LINES][LINE / sizeof(uint32_t)] __attribute__((aligned(LINE)));
++#define X    (&cells[1][0])
++#define X2   (&cells[1][9])
++#define FLAG (&cells[5][0])
++#define ACK  (&cells[7][0])
++static uint32_t sync_count, sync_sense;
++static uint64_t forbidden, observed_rounds;
++
++static void barrier(uint32_t *sense)
++{
++    *sense ^= 1;
++    if (__atomic_add_fetch(&sync_count, 1, __ATOMIC_ACQ_REL) == 2) {
++        __atomic_store_n(&sync_count, 0, __ATOMIC_RELAXED);
++        __atomic_store_n(&sync_sense, *sense, __ATOMIC_RELEASE);
++    } else {
++        while (__atomic_load_n(&sync_sense, __ATOMIC_ACQUIRE) != *sense) {}
++    }
++}
++
++static void writer(int variant)
++{
++    uint32_t sense = 0;
++    barrier(&sense);
++    for (uint32_t round = 1; round <= LITMUS_ROUNDS; ++round) {
++        dstate_add32(X, 1);
++        if (variant == 1) dstate_add32(X2, 1); else dstate_add32(X, 1);
++        __atomic_store_n(FLAG, round, __ATOMIC_RELEASE);   /* plain mov on x86 */
++        while (__atomic_load_n(ACK, __ATOMIC_ACQUIRE) != round) {}
++    }
++    barrier(&sense);
++}
++
++static void *reader(void *arg)
++{
++    int variant = (int)(uintptr_t)arg;
++    uint32_t sense = 0;
++    barrier(&sense);
++    for (uint32_t round = 1; round <= LITMUS_ROUNDS; ++round) {
++        while (__atomic_load_n(FLAG, __ATOMIC_ACQUIRE) != round) {}
++        uint32_t x = __atomic_load_n(X, __ATOMIC_RELAXED);
++        uint32_t x2 = __atomic_load_n(X2, __ATOMIC_RELAXED);
++        ++observed_rounds;
++        if (variant == 1 ? (x < round || x2 < round) : (x < 2 * round)) ++forbidden;
++        __atomic_store_n(ACK, round, __ATOMIC_RELEASE);
++    }
++    barrier(&sense);
++    return NULL;
++}
++
++static int run(int variant)
++{
++    pthread_t r;
++    forbidden = observed_rounds = 0;
++    memset(cells, 0, sizeof cells);
++    bench_roi_begin();
++    bench_thread_check(pthread_create(&r, NULL, reader, (void *)(uintptr_t)variant));
++    writer(variant);
++    pthread_join(r, NULL);
++    bench_roi_end();
++    uint32_t want = variant == 1 ? LITMUS_ROUNDS : 2 * LITMUS_ROUNDS;
++    printf("variant=%d rounds=%llu forbidden=%llu final_x=%u%s\n", variant,
++           (unsigned long long)observed_rounds, (unsigned long long)forbidden,
++           *X, forbidden ? " ORDERING-VIOLATION" : " ok");
++    if (*X != want || (variant == 1 && *X2 != LITMUS_ROUNDS)) { puts("LOST-UPDATE"); return 1; }
++    return forbidden != 0;
++}
++
++int main(void)
++{
++    int bad = run(1);
++    bad |= run(2);
++    puts(bad ? "FAIL" : "PASS: same-line adds never observed behind a younger flag store");
++    return bad;
++}
 diff --git a/bench/random_stress.c b/bench/random_stress.c
 new file mode 100644
 index 0000000..d7a1eee
@@ -1813,10 +1917,10 @@ index 0000000..1ec40df
 +print("Exiting @ tick", m5.curTick(), "because", exit_event.getCause())
 diff --git a/configs/ruby/MOESI_D.py b/configs/ruby/MOESI_D.py
 new file mode 100644
-index 0000000..5e4ada5
+index 0000000..5bdd81e
 --- /dev/null
 +++ b/configs/ruby/MOESI_D.py
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,393 @@
 +# Copyright (c) 2019 ARM Limited
 +# All rights reserved.
 +#
@@ -1949,12 +2053,22 @@ index 0000000..5e4ada5
 +    # O3 only: no-return atomics bypass TSO's one-store-in-flight rule (Intel
 +    # RAO-INT's weakly ordered contract). Software fences where it publishes.
 +    relaxed_amo = flag_env("DSTATE_RELAXED_AMO", "0")
++    # TSO same-line batching of no-return adds (O3 only; legal under TSO).
++    tso_sameline = flag_env("DSTATE_TSO_SAMELINE", "0")
++    # Admission gate on distinct writers, its epoch, promotion on writers, ACK value.
++    min_writers = bounded_env("DSTATE_MIN_WRITERS", "0", 0, 64)
++    writer_epoch = bounded_env("DSTATE_WRITER_EPOCH", "64", 1, 1 << 20)
++    promote_writers = bounded_env("DSTATE_PROMOTE_WRITERS", "0", 0, 64)
++    ack_value = flag_env("DSTATE_ACK_VALUE", "0")
 +    for cpu in cpus:
 +        try:
 +            cpu.relaxedNoReturnAtomics = relaxed_amo
++            cpu.tsoSameLineAtomics = tso_sameline
 +        except AttributeError:
 +            if relaxed_amo:
 +                raise ValueError("DSTATE_RELAXED_AMO requires X86O3CPU")
++            if tso_sameline:
++                raise ValueError("DSTATE_TSO_SAMELINE requires X86O3CPU")
 +
 +    cpu_sequencers = []
 +
@@ -2084,6 +2198,10 @@ index 0000000..5e4ada5
 +            d_state_queue_stall=queue_stall,
 +            d_state_far_reads=far_reads,
 +            d_state_evict_for_delegate=evict_for_delegate,
++            d_state_min_writers=min_writers,
++            d_state_writer_epoch=writer_epoch,
++            d_state_promote_writers=promote_writers,
++            d_state_ack_value=ack_value,
 +            d_state_hit_latency=hit_latency,
 +            d_state_hotwords=hotwords,
 +            d_state_merge_limit=merge_limit,
@@ -2406,10 +2524,10 @@ index 4b31b26..6e65106 100644
              /* For atomic or store-no-data, just use zeroed data */
              std::memset(request_data, 0, size);
 diff --git a/src/cpu/o3/BaseO3CPU.py b/src/cpu/o3/BaseO3CPU.py
-index 3c477c1..f535668 100644
+index 3c477c1..a377d27 100644
 --- a/src/cpu/o3/BaseO3CPU.py
 +++ b/src/cpu/o3/BaseO3CPU.py
-@@ -206,6 +206,11 @@ class BaseO3CPU(BaseCPU):
+@@ -206,6 +206,18 @@ class BaseO3CPU(BaseCPU):
          "Branch Predictor",
      )
      needsTSO = Param.Bool(False, "Enable TSO Memory model")
@@ -2418,22 +2536,30 @@ index 3c477c1..f535668 100644
 +        "No-return atomic stores bypass TSO store ordering (weakly ordered, "
 +        "RAO-INT style); software fences where it publishes",
 +    )
++    tsoSameLineAtomics = Param.Bool(
++        False,
++        "Under TSO, a younger no-return atomic to the SAME cache line may issue "
++        "while older ones to that line are in flight; stores to other lines "
++        "wait for all of them. Legal: the adds are applied as one atomic "
++        "operation at the home, so no observer sees them out of order.",
++    )
  
      recvRespThrottling = Param.Bool(
          False, "Enable load receive response throttling in the LSQ"
 diff --git a/src/cpu/o3/lsq_unit.cc b/src/cpu/o3/lsq_unit.cc
-index 67ae692..b3c1329 100644
+index 67ae692..a053bcc 100644
 --- a/src/cpu/o3/lsq_unit.cc
 +++ b/src/cpu/o3/lsq_unit.cc
-@@ -216,6 +216,7 @@ LSQUnit::init(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params,
+@@ -216,6 +216,8 @@ LSQUnit::init(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params,
      depCheckShift = params.LSQDepCheckShift;
      checkLoads = params.LSQCheckLoads;
      needsTSO = params.needsTSO;
 +    relaxedNoReturnAtomics = params.relaxedNoReturnAtomics;
++    tsoSameLineAtomics = params.tsoSameLineAtomics;
  
      resetState();
  }
-@@ -816,11 +817,13 @@ LSQUnit::writebackStores()
+@@ -816,11 +818,14 @@ LSQUnit::writebackStores()
          writebackBlockedStore();
      }
  
@@ -2444,38 +2570,57 @@ index 67ae692..b3c1329 100644
             storeWBIt->valid() &&
             storeWBIt->canWB() &&
 -           ((!needsTSO) || (!storeInFlight)) &&
-+           ((!needsTSO) || (!storeInFlight) || relaxedStore(*storeWBIt)) &&
++           ((!needsTSO) || (!storeInFlight) || relaxedStore(*storeWBIt) ||
++            sameLineAtomic(*storeWBIt)) &&
             lsq->cachePortAvailable(false)) {
  
          if (isStoreBlocked) {
-@@ -1089,7 +1092,7 @@ LSQUnit::storePostSend()
+@@ -1089,8 +1094,15 @@ LSQUnit::storePostSend()
          }
      }
  
 -    if (needsTSO) {
 +    if (needsTSO && !relaxedStore(*storeWBIt)) {
          storeInFlight = true;
++        if (tsoSameLineAtomics && noReturnAtomic(*storeWBIt)) {
++            if (inFlightAtomics == 0) {
++                inFlightAtomicLine =
++                    storeWBIt->request()->mainReq()->getPaddr() & cacheBlockMask;
++            }
++            ++inFlightAtomics;
++        }
      }
  
-@@ -1162,6 +1165,8 @@ void
+     storeWBIt++;
+@@ -1162,6 +1174,10 @@ void
  LSQUnit::completeStore(typename StoreQueue::iterator store_idx)
  {
      assert(store_idx->valid());
 +    // A relaxed no-return atomic never owned the TSO in-flight slot.
 +    const bool relaxed_store = relaxedStore(*store_idx);
++    const bool sameline_atomic = tsoSameLineAtomics && !relaxed_store &&
++                                 noReturnAtomic(*store_idx) && inFlightAtomics > 0;
      store_idx->completed() = true;
      --storesToWB;
      // A bit conservative because a store completion may not free up entries,
-@@ -1203,7 +1208,7 @@ LSQUnit::completeStore(typename StoreQueue::iterator store_idx)
+@@ -1203,8 +1219,14 @@ LSQUnit::completeStore(typename StoreQueue::iterator store_idx)
  
      store_inst->setCompleted();
  
 -    if (needsTSO) {
+-        storeInFlight = false;
 +    if (needsTSO && !relaxed_store) {
-         storeInFlight = false;
++        if (sameline_atomic) {
++            // the slot stays held until every batched same-line add completes
++            --inFlightAtomics;
++            storeInFlight = inFlightAtomics > 0;
++        } else {
++            storeInFlight = false;
++        }
      }
  
-@@ -1442,7 +1447,12 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
+     // Tell the checker we've completed this instruction.  Some stores
+@@ -1442,7 +1464,12 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
              // data), the store has all of the data needed, and
              // the load is not LLSC, then
              // we can forward data from the store to the load
@@ -2489,7 +2634,7 @@ index 67ae692..b3c1329 100644
                  store_has_lower_limit && store_has_upper_limit &&
                  !request->mainReq()->isLLSC()) {
  
-@@ -1464,7 +1474,7 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
+@@ -1464,7 +1491,7 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
                    (store_has_upper_limit || lower_load_has_store_part))) ||
                  // The store entry is atomic and has all or part of the load's
                  // data
@@ -2499,15 +2644,34 @@ index 67ae692..b3c1329 100644
                    (store_has_upper_limit || lower_load_has_store_part)))) {
  
 diff --git a/src/cpu/o3/lsq_unit.hh b/src/cpu/o3/lsq_unit.hh
-index 40003ce..1885ae6 100644
+index 40003ce..6dfbd4d 100644
 --- a/src/cpu/o3/lsq_unit.hh
 +++ b/src/cpu/o3/lsq_unit.hh
-@@ -519,6 +519,17 @@ class LSQUnit
+@@ -519,6 +519,36 @@ class LSQUnit
      /** Flag for memory model. */
      bool needsTSO;
  
 +    /** No-return atomics bypass TSO store ordering (weakly ordered). */
 +    bool relaxedNoReturnAtomics;
++
++    /** Under TSO, same-line no-return atomics may overlap each other. */
++    bool tsoSameLineAtomics;
++    /** Number of in-flight TSO stores that are no-return atomics to
++     *  inFlightAtomicLine (0 when the in-flight store is an ordinary one). */
++    int inFlightAtomics = 0;
++    Addr inFlightAtomicLine = 0;
++
++    bool noReturnAtomic(SQEntry &e)
++    {
++        return e.hasRequest() && e.request()->mainReq()->isAtomicNoReturn();
++    }
++    /** May this store issue although a TSO store is in flight: it is a
++     *  no-return atomic to the line every in-flight store also targets. */
++    bool sameLineAtomic(SQEntry &e)
++    {
++        return tsoSameLineAtomics && inFlightAtomics > 0 && noReturnAtomic(e) &&
++               (e.request()->mainReq()->getPaddr() & cacheBlockMask) == inFlightAtomicLine;
++    }
 +
 +    /** A no-return atomic store that neither waits for nor holds the TSO
 +     *  in-flight store slot (Intel RAO-INT style weak ordering). */
@@ -2595,10 +2759,10 @@ index ebfa7d1..d842103 100644
  DataBlock::copyPartial(const DataBlock & dblk, int offset, int len)
  {
 diff --git a/src/mem/ruby/network/Network.cc b/src/mem/ruby/network/Network.cc
-index 480b5bc..811a774 100644
+index 480b5bc..d316f8c 100644
 --- a/src/mem/ruby/network/Network.cc
 +++ b/src/mem/ruby/network/Network.cc
-@@ -166,6 +166,20 @@ uint32_t
+@@ -166,6 +166,22 @@ uint32_t
  Network::MessageSizeType_to_int(MessageSizeType size_type)
  {
      switch(size_type) {
@@ -2616,6 +2780,8 @@ index 480b5bc..811a774 100644
 +        return 144;
 +      case MessageSizeType_DState_Response:
 +        return 8;
++      case MessageSizeType_DState_ResponseData:
++        return 16;
        case MessageSizeType_Control:
        case MessageSizeType_Request_Control:
        case MessageSizeType_Reissue_Control:
@@ -2670,10 +2836,10 @@ index 5b584fb..b53aa87 100644
      default n
 diff --git a/src/mem/ruby/protocol/MOESI_D-L1cache.sm b/src/mem/ruby/protocol/MOESI_D-L1cache.sm
 new file mode 100644
-index 0000000..38f3063
+index 0000000..8c522ec
 --- /dev/null
 +++ b/src/mem/ruby/protocol/MOESI_D-L1cache.sm
-@@ -0,0 +1,1734 @@
+@@ -0,0 +1,1739 @@
 +/*
 + * Copyright (c) 2019-2020 ARM Limited
 + * All rights reserved
@@ -3736,7 +3902,12 @@ index 0000000..38f3063
 +  }
 +
 +  action(camo_completeDelegated, "camo", desc="Complete an already-applied remote atomic without executing it twice") {
-+    sequencer.atomicRemoteCallback(address);
++    peek(responseToL1Cache_in, ResponseMsg) {
++      // With d_state_ack_value the ACK carries the updated word; the sequencer
++      // completes a load of that word waiting behind the add from it.
++      DataBlock value := in_msg.DataBlk;
++      sequencer.atomicRemoteCallback(address, value, in_msg.HasValue);
++    }
 +  }
 +
 +  action(d_checkResponseId, "dcheckid", desc="Reject stale or mismatched terminal responses") {
@@ -4410,10 +4581,10 @@ index 0000000..38f3063
 +}
 diff --git a/src/mem/ruby/protocol/MOESI_D-L2cache.sm b/src/mem/ruby/protocol/MOESI_D-L2cache.sm
 new file mode 100644
-index 0000000..4494b03
+index 0000000..0e72df8
 --- /dev/null
 +++ b/src/mem/ruby/protocol/MOESI_D-L2cache.sm
-@@ -0,0 +1,3566 @@
+@@ -0,0 +1,3613 @@
 +/*
 + * Copyright (c) 2019 ARM Limited
 + * All rights reserved
@@ -4489,6 +4660,19 @@ index 0000000..4494b03
 +  // a victim (as an L1 GETX does) instead of rejecting into a migration. Default
 +  // off (reject, as shipped).
 +  bool d_state_evict_for_delegate := "False";
++  // Admission gate: accept a delegated update only once at least min_writers
++  // DISTINCT cores have written the line in the current epoch (writer_epoch
++  // updates, accepted or rejected); otherwise reject it, and the requester takes
++  // the line by the ordinary GETX path and owns it. The epoch gives the exit: a
++  // line that goes quiet or single-writer is rejected again and ownership
++  // resumes. 0 disables the gate (accept everything, as before).
++  int d_state_min_writers := 0;
++  int d_state_writer_epoch := 64;
++  // Promotion to D on distinct writers in the epoch (0: the update-count rule).
++  int d_state_promote_writers := 0;
++  // The terminal ACK carries the updated word (16 B response class) so the
++  // requester can complete a load of that word that is waiting behind the add.
++  bool d_state_ack_value := "False";
 +  //   hit_latency   service time when the target word is in the bank's hot-word
 +  //                 buffer (registers, not the SRAM array); default = full latency
 +  //   hotwords      hot-word buffer entries per bank; 0 disables the model
@@ -4753,6 +4937,9 @@ index 0000000..4494b03
 +
 +  bool dstateWouldPromote(Entry ce, MachineID req) {
 +    if (d_state_persistence == false || is_invalid(ce)) { return false; }
++    // With d_state_promote_writers the in_port decides on the writer bitmap
++    // (it can see the engine helpers); this count rule is then unused.
++    if (d_state_promote_writers > 0) { return false; }
 +    if (ce.DStateReqCount + 1 < d_state_hot_threshold) { return false; }
 +    return ce.DStateMultipleRequesters ||
 +           (ce.DStateSeenRequester && ce.DStateFirstRequester != req);
@@ -5331,6 +5518,13 @@ index 0000000..4494b03
 +          // absorb this update. Addition is associative, so one read-modify-write
 +          // with the summed operand is exact; the requester is recorded and gets
 +          // its own terminal ACK. No executor slot or TBE is consumed.
++          // Admission gate on distinct writers (see d_state_min_writers). A line
++          // the home has no entry for counts as single-writer: it starts owned.
++          bool few_writers := false;
++          if (d_state_min_writers > 0) {
++            few_writers := dStateEngine.writersAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor)) <
++                           d_state_min_writers;
++          }
 +          TBE ptbe := TBEs[in_msg.addr];
 +          bool mergeable := pending && d_state_merge_limit > 0 && is_valid(ptbe) &&
 +                            ptbe.DStateHasOp &&
@@ -5344,6 +5538,8 @@ index 0000000..4494b03
 +            trigger(Event:DState_Merge, in_msg.addr, ce, TBEs[in_msg.addr]);
 +          } else if (busy && d_state_busy_stall) {
 +            trigger(Event:DState_Busy, in_msg.addr, ce, TBEs[in_msg.addr]);
++          } else if (few_writers) {
++            trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);
 +          } else if (owner_ok && d_state_queue_stall &&
 +                     dStateEngine.hasCapacity(d_state_queue_depth) == false) {
 +            trigger(Event:DState_Full, in_msg.addr, ce, TBEs[in_msg.addr]);
@@ -5363,7 +5559,10 @@ index 0000000..4494b03
 +            trigger(Event:L2_Replacement, victim, getCacheEntry(victim), TBEs[victim]);
 +          } else if (is_invalid(ce) && L2cache.cacheAvail(in_msg.addr) == false) {
 +            trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);
-+          } else if (dstateWouldPromote(ce, in_msg.Requestor) || st == State:D) {
++          } else if (dstateWouldPromote(ce, in_msg.Requestor) || st == State:D ||
++                     (d_state_promote_writers > 0 && d_state_persistence &&
++                      dStateEngine.writersAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor)) >=
++                      d_state_promote_writers)) {
 +            trigger(Event:DState_Hot, in_msg.addr, ce, TBEs[in_msg.addr]);
 +          } else {
 +            trigger(Event:DState_Cold, in_msg.addr, ce, TBEs[in_msg.addr]);
@@ -6266,6 +6465,11 @@ index 0000000..4494b03
 +  // Up to d_state_queue_depth accepted operations per L2 bank (one per line, since
 +  // the TBE is per address); reserve the executor slot and TBE/cache slot before
 +  // consuming the request. NACK is terminal non-acceptance, never a timeout or replay.
++  action(d_noteWriter, "dwriter", desc="Record the requester in the line's distinct-writer epoch") {
++    peek(L1requestNetwork_in, RequestMsg) {
++      dStateEngine.noteWriter(address, machineIDToNodeID(in_msg.Requestor), d_state_writer_epoch);
++    }
++  }
 +  action(d_reject, "drej", desc="Reject before application") {
 +    peek(L1requestNetwork_in, RequestMsg) {
 +      enqueue(responseNetwork_out, ResponseMsg, response_latency) {
@@ -6312,6 +6516,7 @@ index 0000000..4494b03
 +        tbe.DStateMerged.orMasks(in_msg.DStateMask32, in_msg.DStateMask64);
 +      }
 +      tbe.DStateMerged.add(in_msg.Requestor, in_msg.DStateId);
++      dStateEngine.noteWriter(address, machineIDToNodeID(in_msg.Requestor), d_state_writer_epoch);
 +    }
 +  }
 +  action(d_start, "dstart", desc="Charge service time; successive starts are spaced by the initiation interval") {
@@ -6357,6 +6562,7 @@ index 0000000..4494b03
 +    if (cache_entry.DStateReqCount < d_state_hot_threshold) {
 +      cache_entry.DStateReqCount := cache_entry.DStateReqCount + 1;
 +    }
++    dStateEngine.noteWriter(address, machineIDToNodeID(tbe.DStateOrig), d_state_writer_epoch);
 +    cache_entry.DStateReadRun := 0;
 +    tbe.DStateHasOp := false;
 +  }
@@ -6371,6 +6577,12 @@ index 0000000..4494b03
 +      out_msg.SenderMachine := MachineType:L2Cache;
 +      out_msg.DStateId := tbe.DStateId;
 +      out_msg.MessageSize := MessageSizeType:DState_Response;
++      if (d_state_ack_value) {
++        // the updated word rides in the ACK: 8 B status + 8 B value, one flit
++        out_msg.DataBlk := cache_entry.DataBlk;
++        out_msg.HasValue := true;
++        out_msg.MessageSize := MessageSizeType:DState_ResponseData;
++      }
 +    }
 +  }
 +  action(d_finish, "dfinish", desc="Release the executor after the ACK was queued") {
@@ -6403,6 +6615,11 @@ index 0000000..4494b03
 +      out_msg.SenderMachine := MachineType:L2Cache;
 +      out_msg.DStateId := tbe.DStateMerged.id(tbe.DStateMerged.count() - 1);
 +      out_msg.MessageSize := MessageSizeType:DState_Response;
++      if (d_state_ack_value) {
++        out_msg.DataBlk := cache_entry.DataBlk;
++        out_msg.HasValue := true;
++        out_msg.MessageSize := MessageSizeType:DState_ResponseData;
++      }
 +    }
 +    tbe.DStateMerged.popBack();
 +  }
@@ -7775,6 +7992,7 @@ index 0000000..4494b03
 +
 +  // Rejection is available in every state and never allocates or mutates data.
 +  transition({I, ILS, ILX, ILO, ILOX, ILOS, ILOSX, S, O, OLS, OLSX, SLS, M, D, IGDX, IGDXO, IGD_P, DX_DRAIN, D_EXEC_M, D_EXEC_D, D_ACKING_M, D_ACKING_D, IFGX, IFGS, ISFGS, IFGXX, IFGXXD, OLSF, ILOW, ILOXW, ILOSW, ILOSXW, ILSW, IW, ILXW, SLSW, OLSW, OW, SW, OXW, OLSXW, IFLS, IFLO, IFLOX, IFLOXX, IFLOSX, IFLXO, IGS, IGM, IGMLS, IGMO, IGMOU, IGMIO, OGMIO, IGMIOF, IGMIOFD, IGMIOFS, OGMIOF, II, MM, SS, OO, OLSS, OLSXS, SLSS, OI, MI, MII, OLSI, ILSI, ILOSD, ILOSXD, ILOD, ILXD, ILOXD}, DState_Reject) {
++    d_noteWriter;
 +    d_reject;
 +    o_popL1RequestQueue;
 +  }
@@ -9449,10 +9667,10 @@ index 0000000..c2eb593
 +}
 diff --git a/src/mem/ruby/protocol/MOESI_D-msg.sm b/src/mem/ruby/protocol/MOESI_D-msg.sm
 new file mode 100644
-index 0000000..a8c7875
+index 0000000..3420521
 --- /dev/null
 +++ b/src/mem/ruby/protocol/MOESI_D-msg.sm
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,230 @@
 +/*
 + * Copyright (c) 2019 ARM Limited
 + * All rights reserved
@@ -9518,6 +9736,8 @@ index 0000000..a8c7875
 +  void hotWordDrop(Addr);
 +  void hotWordTouchMask(Addr, int, int, int);
 +  bool masksValid(int, int);
++  int writersAfter(Addr, NodeID);
++  void noteWriter(Addr, NodeID, int);
 +  uint64_t nextId();
 +}
 +
@@ -9655,6 +9875,7 @@ index 0000000..a8c7875
 +  int Acks,                    desc="How many acks to expect";
 +  MessageSizeType MessageSize, desc="size category of the message";
 +  uint64_t DStateId, default="0", desc="Correlates terminal delegated completion/rejection";
++  bool HasValue, default="false", desc="DSTATE_ACK carries the updated word in DataBlk (16 B response)";
 +
 +  bool functionalRead(Packet *pkt) {
 +    // Read only those messages that contain the data
@@ -9693,7 +9914,7 @@ index 0000000..b0ec98f
 +include "MOESI_D-dma.sm";
 +include "MOESI_D-dir.sm";
 diff --git a/src/mem/ruby/protocol/RubySlicc_Exports.sm b/src/mem/ruby/protocol/RubySlicc_Exports.sm
-index 33c1b55..ead4e24 100644
+index 33c1b55..4131359 100644
 --- a/src/mem/ruby/protocol/RubySlicc_Exports.sm
 +++ b/src/mem/ruby/protocol/RubySlicc_Exports.sm
 @@ -78,11 +78,14 @@ structure(WriteMask, external="yes", desc="...") {
@@ -9711,7 +9932,7 @@ index 33c1b55..ead4e24 100644
    int numAtomicLogEntries();
    void clearAtomicLogEntries();
  }
-@@ -290,6 +293,20 @@ enumeration(MachineType, desc="...", default="MachineType_NULL") {
+@@ -290,6 +293,21 @@ enumeration(MachineType, desc="...", default="MachineType_NULL") {
  
  // MessageSizeType
  enumeration(MessageSizeType, desc="...") {
@@ -9729,18 +9950,19 @@ index 33c1b55..ead4e24 100644
 +  DState_UpdateW16, desc="80-byte delta update: header + up to 16 word slots";
 +  DState_UpdateW32, desc="144-byte delta update: header + a full 128-byte delta line";
 +  DState_Response, desc="8-byte terminal ACK/NACK: tag, requester, status";
++  DState_ResponseData, desc="16-byte terminal ACK carrying the updated 8-byte word";
    Control,    desc="Control Message";
    Data,       desc="Data Message";
    Request_Control, desc="Request";
 diff --git a/src/mem/ruby/protocol/RubySlicc_Types.sm b/src/mem/ruby/protocol/RubySlicc_Types.sm
-index 848d164..b36a976 100644
+index 848d164..f997a5a 100644
 --- a/src/mem/ruby/protocol/RubySlicc_Types.sm
 +++ b/src/mem/ruby/protocol/RubySlicc_Types.sm
 @@ -139,6 +139,7 @@ structure (Sequencer, external = "yes") {
                       Cycles, Cycles, Cycles);
    void writeUniqueCallback(Addr, DataBlock);
  
-+  void atomicRemoteCallback(Addr);
++  void atomicRemoteCallback(Addr, DataBlock, bool);
    void atomicCallback(Addr, DataBlock);
    void atomicCallback(Addr, DataBlock, bool);
    void atomicCallback(Addr, DataBlock, bool, MachineType);
@@ -9757,10 +9979,10 @@ index 848d164..b36a976 100644
    PacketPtr pkt,             desc="Packet associated with this request";
 diff --git a/src/mem/ruby/structures/DStateEngine.hh b/src/mem/ruby/structures/DStateEngine.hh
 new file mode 100644
-index 0000000..bd3fb48
+index 0000000..1f44c7a
 --- /dev/null
 +++ b/src/mem/ruby/structures/DStateEngine.hh
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,185 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Finite-capacity bank executor reference model, not a synthesized datapath.
 +// Capacity, initiation interval, service latencies and the hot-word buffer are
@@ -9777,6 +9999,7 @@ index 0000000..bd3fb48
 +#include <limits>
 +#include <ostream>
 +#include <utility>
++#include <unordered_map>
 +#include <vector>
 +
 +namespace gem5::ruby
@@ -9825,6 +10048,42 @@ index 0000000..bd3fb48
 +class DStateEngine
 +{
 +  public:
++    // Distinct-writer bookkeeping for the admission gate: a bounded per-bank
++    // table (line -> bitmap of requester node ids, updates in epoch). It is kept
++    // outside the cache entry because a line the home does not hold has no
++    // entry, yet its rejected writers must still be counted. When the table is
++    // full the oldest entry is dropped (that line starts as single-writer again).
++    struct WriterEntry { std::uint64_t bits = 0; int updates = 0; std::uint64_t age = 0; };
++    static constexpr std::size_t kWriterTable = 1024;
++    std::unordered_map<std::uint64_t, WriterEntry> writers;
++    std::uint64_t writerClock = 0;
++
++    // Writers of `line` once `node` is counted (no state change).
++    int writersAfter(std::uint64_t line, int node) const
++    {
++        auto it = writers.find(line);
++        std::uint64_t bits = it == writers.end() ? 0 : it->second.bits;
++        if (node >= 0 && node < 64) bits |= std::uint64_t(1) << node;
++        int n = 0;
++        for (; bits; bits &= bits - 1) ++n;
++        return n;
++    }
++    // Record one update (accepted or rejected) from `node`; every `epoch`
++    // updates the line's bitmap restarts from this writer alone.
++    void noteWriter(std::uint64_t line, int node, int epoch)
++    {
++        if (writers.size() >= kWriterTable && !writers.count(line)) {
++            auto victim = writers.begin();
++            for (auto it = writers.begin(); it != writers.end(); ++it)
++                if (it->second.age < victim->second.age) victim = it;
++            writers.erase(victim);
++        }
++        WriterEntry &e = writers[line];
++        if (++e.updates >= epoch) { e.bits = 0; e.updates = 0; }
++        if (node >= 0 && node < 64) e.bits |= std::uint64_t(1) << node;
++        e.age = ++writerClock;
++    }
++    void forgetWriters(std::uint64_t line) { writers.erase(line); }
 +    // One request's own masks must not claim a byte at both widths.
 +    bool masksValid(int m32, int m64) const
 +    {
@@ -9977,7 +10236,7 @@ index 0000000..5a1b144
 +} // namespace gem5::ruby
 +#endif
 diff --git a/src/mem/ruby/system/Sequencer.cc b/src/mem/ruby/system/Sequencer.cc
-index ec9b417..8b156e3 100644
+index ec9b417..91c9f56 100644
 --- a/src/mem/ruby/system/Sequencer.cc
 +++ b/src/mem/ruby/system/Sequencer.cc
 @@ -42,6 +42,9 @@
@@ -10039,12 +10298,12 @@ index ec9b417..8b156e3 100644
              break;
          }
  
-@@ -695,6 +706,167 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
+@@ -695,6 +706,187 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
      }
  }
  
 +void
-+Sequencer::atomicRemoteCallback(Addr address)
++Sequencer::atomicRemoteCallback(Addr address, DataBlock &value, bool hasValue)
 +{
 +    // Completion only: the home controller already applied the operation.
 +    // Calling hitCallback here would execute its functor a second time.
@@ -10066,10 +10325,15 @@ index ec9b417..8b156e3 100644
 +    panic_if(count < 1 || count > int(requests.size()),
 +             "Combined no-return atomic covers more requests than are queued");
 +    std::vector<PacketPtr> completed;
++    Addr word_lo = 0, word_hi = 0;
 +    for (int i = 0; i < count; ++i) {
 +        auto &request = requests.front();
 +        panic_if(request.m_type != RubyRequestType_ATOMIC_NO_RETURN,
 +                 "Remote completion is only valid for a no-return atomic");
++        if (i == 0) {
++            word_lo = request.pkt->getAddr();
++            word_hi = word_lo + request.pkt->getSize();
++        }
 +        recordMissLatency(&request, true, MachineType_NUM, true,
 +                          Cycles(0), Cycles(0), Cycles(0));
 +        markRemoved();
@@ -10077,6 +10341,21 @@ index ec9b417..8b156e3 100644
 +        requests.pop_front();
 +    }
 +    llscClearMonitor(address);
++    // ACK-with-value: only the add's own word is carried (16 B response), so a
++    // load waiting behind the add is completed from it only when it lies within
++    // that word; anything else is issued as usual.
++    while (hasValue && !requests.empty() &&
++           requests.front().m_type == RubyRequestType_LD &&
++           requests.front().pkt->getAddr() >= word_lo &&
++           requests.front().pkt->getAddr() + requests.front().pkt->getSize() <= word_hi) {
++        auto &load = requests.front();
++        recordMissLatency(&load, true, MachineType_NUM, true,
++                          Cycles(0), Cycles(0), Cycles(0));
++        markRemoved();
++        hitCallback(&load, value, true, MachineType_NUM, true,
++                    Cycles(0), Cycles(0), Cycles(0), false);
++        requests.pop_front();
++    }
 +    if (requests.empty()) {
 +        m_RequestTable.erase(it);
 +    } else {
@@ -10207,7 +10486,7 @@ index ec9b417..8b156e3 100644
  void
  Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
                         bool llscSuccess,
-@@ -1009,7 +1181,7 @@ Sequencer::makeRequest(PacketPtr pkt)
+@@ -1009,7 +1201,7 @@ Sequencer::makeRequest(PacketPtr pkt)
      } else if (pkt->req->isTlbiCmd()) {
          primary_type = secondary_type = tlbiCmdToRubyRequestType(pkt);
          DPRINTF(RubySequencer, "Issuing TLBI\n");
@@ -10216,7 +10495,7 @@ index ec9b417..8b156e3 100644
      } else if (pkt->isAtomicOp()) {
          if (pkt->req->isAtomicReturn()){
              DPRINTF(RubySequencer, "Issuing ATOMIC RETURN \n");
-@@ -1087,7 +1259,8 @@ Sequencer::makeRequest(PacketPtr pkt)
+@@ -1087,7 +1279,8 @@ Sequencer::makeRequest(PacketPtr pkt)
  }
  
  void
@@ -10226,7 +10505,7 @@ index ec9b417..8b156e3 100644
  {
      assert(pkt != NULL);
      ContextID proc_id = pkt->req->hasContextId() ?
-@@ -1152,6 +1325,44 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
+@@ -1152,6 +1345,44 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
                                  (offset, pkt->getAtomicOp()));
  
              msg->setWriteMask(offset, pkt->getSize(), atomicOps);
@@ -10272,7 +10551,7 @@ index ec9b417..8b156e3 100644
  
          DPRINTFR(ProtocolTrace, "%15s %3s %10s%20s %6s>%-6s %#x %s\n",
 diff --git a/src/mem/ruby/system/Sequencer.hh b/src/mem/ruby/system/Sequencer.hh
-index f530eb4..04bbcaa 100644
+index f530eb4..8e2fcca 100644
 --- a/src/mem/ruby/system/Sequencer.hh
 +++ b/src/mem/ruby/system/Sequencer.hh
 @@ -60,6 +60,16 @@ namespace gem5
@@ -10296,7 +10575,7 @@ index f530eb4..04bbcaa 100644
                        const Cycles forwardRequestTime = Cycles(0),
                        const Cycles firstResponseTime = Cycles(0));
  
-+    void atomicRemoteCallback(Addr address);
++    void atomicRemoteCallback(Addr address, DataBlock &value, bool hasValue);
 +
      void atomicCallback(Addr address,
                          DataBlock& data,

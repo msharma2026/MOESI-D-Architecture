@@ -185,6 +185,37 @@ The `graph_push` application run with the round-4 knobs rejected 85% of its adds
 on the 8 MB working set (the home's sets were full and the shipped behaviour is
 to reject); the eviction-for-delegate variants are the rows that count there.
 
+### Round 6 (2026-10-02): admission gate, TSO same-line batching, ACK value
+
+Gates on the round-6 build, every mode CORRECT and through the coverage gate:
+regression with batching alone (O3 TSO) 4/4; regression with gate (2 writers),
+batching, ACK value and promotion-on-writers on O3 TSO, Minor TSO and O3
+fenced-relaxed 4/4 each, with both admission paths exercised (hundreds of
+rejections, ~15,000 accepted delegations per run). Ordering: the existing litmus
+with batching on (L40, L44) 0 forbidden; the new `ordering_litmus2` (two adds to
+one line — two words, or one word twice — then a flag store to another line;
+the reader must never see the flag before every add) 0 forbidden in 40,000
+rounds each with batching on, off, and on the conventional path; the fenced
+variant under relaxed ordering with ACK value 0 forbidden.
+
+One defect found by the coverage gate before any performance number was taken:
+the first admission gate kept its writer bitmap in the L2 cache entry, and a
+line the home does not hold (an L1 owns it: state ILX) has no entry, so rejected
+writers were never counted and the gate admitted nothing. The bitmap moved into
+a bounded per-bank table in the engine (1,024 lines, oldest dropped), which is
+also the more realistic hardware. Runs made with the broken gate are archived
+outside the run table.
+
+What the gate cannot do: distinguish shared lines where the owner still wins
+(CMS at 4 cores: every hot line has 4 writers, yet most of a core's adds would
+hit lines it already holds) from shared lines where delegation wins (512 lines,
+also 4 writers each). A threshold above the core count rejects everything and
+costs a NACK round trip per add before the migration (+37% on 512 lines); a
+threshold below it keeps the many-line win (−17% vs −21% without the gate) but
+admits CMS (+22%). The writer count separates single-writer from shared lines,
+not the two kinds of shared line; the signal that would is the owner's expected
+hit rate, which the home does not observe.
+
 ### Measurement caveats that apply to every number
 
 - **Whole-program `simSeconds`, no ROI.** `libm5` was not built, so times include
