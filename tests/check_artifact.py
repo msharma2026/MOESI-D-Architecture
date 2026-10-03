@@ -144,26 +144,34 @@ class ArtifactChecks(unittest.TestCase):
         self.assertIn("trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);", l2[i:i + 700])
 
 
-    def test_round7_change_gate_and_tenure_predictor_guards(self):
+    def test_round7_8_change_gate_and_cheap_rejection_guards(self):
         l1 = (ROOT / "protocol/MOESI_D-L1cache.sm").read_text(encoding="utf-8")
-        eng = (ROOT / "protocol/DStateEngine.hh").read_text(encoding="utf-8")
-        # The predictor only ever downgrades a delegation to the ordinary GETX
-        # path (LocalAtomic_CPU); it never invents a delegation.
-        self.assertIn("if (d_state_enabled && localOnly == false && tenureAllowsDelegation(addr)) "
-                      "{ return Event:DStateReq_CPU; }", l1)
-        self.assertIn("if (d_state_max_tenure == 0) { return true; }", l1)
-        self.assertIn("if (tenure < 0) { return d_state_tenure_probe == false; }", l1)
-        # Every way an owned line leaves this L1 records the tenure (8 transitions),
-        # and every locally applied add counts toward it.
-        self.assertEqual(l1.count("    d_noteOwnershipLost;\n"), 8)
-        self.assertIn("dStateRequests.noteOwnerAdd(address);", l1)
-        self.assertIn("int predictedTenure(std::uint64_t line, std::uint64_t now, std::uint64_t idle) const", eng)
-        # The gate tables are bounded (hardware-sized), not unbounded maps.
-        self.assertIn("kWriterTable = 1024", eng)
-        self.assertIn("kTenureTable = 1024", eng)
-        # Functional-read fallback order: L2 copy before memory via the directory.
         l2 = (ROOT / "protocol/MOESI_D-L2cache.sm").read_text(encoding="utf-8")
         d = (ROOT / "protocol/MOESI_D-dir.sm").read_text(encoding="utf-8")
+        eng = (ROOT / "protocol/DStateEngine.hh").read_text(encoding="utf-8")
+        # Round 8 pruning: the distinct-writer gate, promotion on writers, the
+        # adaptive threshold and the owner-tenure predictor are gone.
+        for gone in ("min_writers", "promote_writers", "adaptive", "writersAfter", "gatePct"):
+            self.assertNotIn(gone, l2, gone)
+        self.assertNotIn("tenure", l1.lower())
+        self.assertNotIn("Tenure", eng)
+        # The change-rate gate: bounded table, decision before any acceptance path,
+        # every stable-state GETX feeds it (13 transitions).
+        self.assertIn("void noteAccess(std::uint64_t line, int node, std::uint64_t now, int epoch, std::uint64_t idle, int table)", eng)
+        self.assertIn("dStateEngine.changePct(in_msg.addr, machineIDToNodeID(in_msg.Requestor),", l2)
+        self.assertLess(l2.index("if (d_state_min_change_pct > 0) {"), l2.index("} else if (mergeable) {"))
+        self.assertEqual(l2.count("    d_noteMigration;\n"), 13)
+        # Reject-as-GETX: a rejected request becomes L1_GETX only behind the knob,
+        # never for malformed requests or forced NACK; the L1 completes it through
+        # the same OM_AMO path as a fallback GETX.
+        self.assertEqual(l2.count("trigger(Event:L1_GETX, in_msg.addr, ce, TBEs[in_msg.addr]);"), 1)
+        self.assertEqual(l2.count("if (d_state_reject_as_getx && st != State:D) {"), 1)
+        self.assertLess(l2.index("d_state_force_nack || format_ok == false"), l2.index("} else if (gate_reject) {"))
+        self.assertIn("transition(D_REQ, {Exclusive_Data, Data}, OM_AMO) {", l1)
+        self.assertIn("transition(D_REQ_S, {Data, Exclusive_Data}, OM_AMO) {", l1)
+        # Promotion on the gate's evidence is persistence-only, like every retention rule.
+        self.assertIn("(d_state_promote_changes > 0 && d_state_persistence &&", l2)
+        # Functional-read fallback order: L2 copy before memory via the directory.
         self.assertIn("int functionalReadPriority() {\n    return 20;", l2)
         self.assertIn("int functionalReadPriority() {\n    return 30;", d)
 
@@ -173,9 +181,8 @@ class ArtifactChecks(unittest.TestCase):
         TSO same-line rule holds the in-flight slot until every batched add
         completes."""
         l2 = (ROOT / "protocol/MOESI_D-L2cache.sm").read_text(encoding="utf-8")
-        self.assertIn("} else if (few_writers) {", l2)
+        self.assertIn("} else if (gate_reject) {", l2)
         self.assertIn("d_noteWriter;", l2)
-        self.assertIn("curCycle(), d_state_writer_idle) < d_state_min_writers", l2)
         self.assertIn("dStateEngine.noteAccess(address, machineIDToNodeID(tbe.DStateOrig), curCycle(),", l2)
         # Round 7: the change-rate gate rejects before any acceptance path, and
         # every stable-state GETX feeds the gate table (13 transitions).

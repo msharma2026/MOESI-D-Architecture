@@ -669,6 +669,154 @@ v7)
   all)
     for ph in gates strict sixteen tenure probe; do echo "--- $ph $(date +%H:%M)"; bash "$0" v7 $ph; done ;;
   esac ;;
+v8)
+  # Round 8: pruning (writer gate, promotion, adaptive, tenure predictor removed), gate
+  # table size, reject-as-GETX, speculation oracle. The v6/v7 tenure/writer-gate phases
+  # above are historical: their knobs now fail fast in configs/MOESI_D.py.
+  # Phases: gates | prune | table | rejectx | oracle | all
+  KN_V3="DSTATE_QUEUE_DEPTH=16 DSTATE_INIT_INTERVAL=4 DSTATE_BUSY_STALL=1 DSTATE_QUEUE_STALL=1 DSTATE_REQ_COMBINE=16 DSTATE_MERGE_LIMIT=64"
+  FAR="DSTATE_FAR_READS=1 DSTATE_READ_DOWNGRADE=64 DSTATE_EVICT_FOR_DELEGATE=1"
+  KN_T4="$KN_V3 DSTATE_EXEC_LATENCY=20 $FAR"
+  KN_TH4="$KN_V3 DSTATE_HOTWORDS=32 DSTATE_HIT_LATENCY=4 $FAR"
+  KN_R4="$KN_TH4 DSTATE_RELAXED_AMO=1 DSTATE_DELTA_MIN_WORDS=2"
+  SL="DSTATE_TSO_SAMELINE=1 DSTATE_DELTA_MIN_WORDS=2"
+  ACKV="DSTATE_ACK_VALUE=1"
+  BUF16="DSTATE_BUFFER_SIZE=${BUF16:-256}"
+  CG="DSTATE_MIN_CHANGE_PCT=50 DSTATE_MIN_CHANGES=2 DSTATE_WRITER_IDLE=200000"
+  CG90="DSTATE_MIN_CHANGE_PCT=90 DSTATE_MIN_CHANGES=2 DSTATE_WRITER_IDLE=200000"
+  T256="DSTATE_GATE_TABLE=256"
+  RG="DSTATE_REJECT_AS_GETX=1"
+  FS="DSTATE_DELEGATE_FROM_S=1"
+  PERF3="local,remote,persistent"
+  case ${2:-all} in
+  gates)
+    matrix G50_regress_TH4_SCR_o3     coherence_regression        "" 5 X86O3CPU    $KN_TH4 $SL $CG $RG $ACKV &
+    matrix G51_regress_TH4_CR_minor   coherence_regression        "" 5 X86MinorCPU $KN_TH4 $CG $RG &
+    matrix G52_regress_R4_CR_fenced   coherence_regression_fenced "" 5 X86O3CPU    $KN_R4 $CG $RG $ACKV &
+    matrix G53_regress_TH4_SC90R_o3   coherence_regression        "" 5 X86O3CPU    $KN_TH4 $SL $CG90 $RG &
+    wait
+    matrix G54_regress_TH4_SC_T256_o3 coherence_regression        "" 5 X86O3CPU    $KN_TH4 $SL $CG $T256 &
+    matrix G55_regress_TH4_SFSV_o3    coherence_regression        "" 5 X86O3CPU    $KN_TH4 $SL $FS $ACKV &
+    matrix G56_regress_TH4_SC90R_fromS coherence_regression       "" 5 X86O3CPU    $KN_TH4 $SL $CG90 $RG $FS &
+    litmus L60_litmus_unfenced_T4_SCR          ordering_litmus  DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_TH4 $SL $CG $RG &
+    litmus L61_litmus2_unfenced_T4_SC90R       ordering_litmus2 DSTATE_ENABLED=1 DSTATE_PERSISTENCE=1 $KN_TH4 $SL $CG90 $RG &
+    wait ;;
+  prune)
+    # pruning must not move anything: these repeat C0/C1/C2/C8 on the pruned build
+    MODES=$PERF3 matrix R0_hotkey800k_TH4_SC        scatter_dstate "4 200000 1"     4 X86O3CPU $KN_TH4 $SL $CG &
+    MODES=$PERF3 matrix R1_multi512_T4_SC           scatter_multi  "4 2000 512"     4 X86O3CPU $KN_T4 $SL $CG &
+    MODES=$PERF3 matrix R2_cms_T4_SC                cms_dstate     "4 20000"        4 X86O3CPU $KN_T4 $SL $CG &
+    wait
+    MODES=$PERF3 matrix R3_multi512_R4_C            scatter_multi  "4 2000 512"     4 X86O3CPU $KN_R4 $CG &
+    wait ;;
+  table)
+    MODES=$PERF3 matrix R4_cms_T4_SC_T256           cms_dstate     "4 20000"        4 X86O3CPU $KN_T4 $SL $CG $T256 &
+    MODES=$PERF3 matrix R5_multi512_T4_SC_T256      scatter_multi  "4 2000 512"     4 X86O3CPU $KN_T4 $SL $CG $T256 &
+    wait
+    export TIMEOUT=7200
+    MODES=$PERF3 matrix R16_multi512_16c_R4_C_T256  scatter_multi  "16 500 512"     16 X86O3CPU $KN_R4 $CG $T256 $BUF16 &
+    MODES=$PERF3 matrix R17_hotkey800k_16c_TH4_SC_T256 scatter_dstate "16 50000 1"  16 X86O3CPU $KN_TH4 $SL $CG $T256 $BUF16 &
+    wait ;;
+  rejectx)
+    # cheap rejection: same gate, then a stricter gate that rejection cost used to forbid
+    MODES=$PERF3 matrix R6_cms_T4_SCR               cms_dstate     "4 20000"        4 X86O3CPU $KN_T4 $SL $CG $RG &
+    MODES=$PERF3 matrix R7_multi512_T4_SCR          scatter_multi  "4 2000 512"     4 X86O3CPU $KN_T4 $SL $CG $RG &
+    MODES=$PERF3 matrix R8_hotkey800k_TH4_SCR       scatter_dstate "4 200000 1"     4 X86O3CPU $KN_TH4 $SL $CG $RG &
+    wait
+    MODES=$PERF3 matrix R9_rw800k_T4_SCRV           scatter_rw     "4 200000 32 8"  4 X86O3CPU $KN_T4 $SL $CG $RG $ACKV &
+    MODES=$PERF3 matrix R10_cms_T4_SC90R            cms_dstate     "4 20000"        4 X86O3CPU $KN_T4 $SL $CG90 $RG &
+    MODES=$PERF3 matrix R11_multi512_T4_SC90R       scatter_multi  "4 2000 512"     4 X86O3CPU $KN_T4 $SL $CG90 $RG &
+    wait
+    MODES=$PERF3 matrix R12_rw800k_T4_SC90RV        scatter_rw     "4 200000 32 8"  4 X86O3CPU $KN_T4 $SL $CG90 $RG $ACKV &
+    MODES=$PERF3 matrix R13_hotkey800k_TH4_SC90R    scatter_dstate "4 200000 1"     4 X86O3CPU $KN_TH4 $SL $CG90 $RG &
+    MODES=$PERF3 matrix R14_scatter800k_T4_SC90R    scatter_dstate "4 200000 32"    4 X86O3CPU $KN_T4 $SL $CG90 $RG &
+    wait
+    export TIMEOUT=7200
+    MODES=$PERF3 matrix R18_multi512_16c_R4_CR      scatter_multi  "16 500 512"     16 X86O3CPU $KN_R4 $CG $RG $BUF16 &
+    MODES=$PERF3 matrix R19_hotkey800k_16c_TH4_SCR  scatter_dstate "16 50000 1"     16 X86O3CPU $KN_TH4 $SL $CG $RG $BUF16 &
+    wait
+    MODES=$PERF3 matrix R20_rw800k_16c_T4_SCRV      scatter_rw     "16 50000 32 8"  16 X86O3CPU $KN_T4 $SL $CG $RG $ACKV $BUF16 &
+    MODES=$PERF3 matrix R21_cms_16c_T4_SCR          cms_dstate     "16 5000"        16 X86O3CPU $KN_T4 $SL $CG $RG $BUF16 &
+    wait
+    MODES=$PERF3 matrix R22_multi512_16c_R4_C90R    scatter_multi  "16 500 512"     16 X86O3CPU $KN_R4 $CG90 $RG $BUF16 &
+    MODES=$PERF3 matrix R23_rw800k_16c_T4_SC90RV    scatter_rw     "16 50000 32 8"  16 X86O3CPU $KN_T4 $SL $CG90 $RG $ACKV $BUF16 &
+    wait ;;
+  promote)
+    # promotion on the gate's evidence (replaces promotion on writers): the
+    # read-mixed rows need the line retained in D for far reads to engage.
+    PC="DSTATE_PROMOTE_CHANGES=2"
+    matrix G57_regress_TH4_SC90RPV_o3  coherence_regression        "" 5 X86O3CPU    $KN_TH4 $SL $CG90 $RG $PC $ACKV &
+    matrix G58_regress_R4_CRP_fenced   coherence_regression_fenced "" 5 X86O3CPU    $KN_R4 $CG $RG $PC &
+    MODES=$PERF3 matrix X9_rw800k_T4_SCRPV          scatter_rw     "4 200000 32 8"  4 X86O3CPU $KN_T4 $SL $CG $RG $PC $ACKV &
+    wait
+    MODES=$PERF3 matrix X12_rw800k_T4_SC90RPV       scatter_rw     "4 200000 32 8"  4 X86O3CPU $KN_T4 $SL $CG90 $RG $PC $ACKV &
+    MODES=$PERF3 matrix X3_rw800k_T4_SCPV           scatter_rw     "4 200000 32 8"  4 X86O3CPU $KN_T4 $SL $CG $PC $ACKV &
+    wait
+    export TIMEOUT=7200
+    MODES=$PERF3 matrix X20_rw800k_16c_T4_SCPV      scatter_rw     "16 50000 32 8"  16 X86O3CPU $KN_T4 $SL $CG $PC $ACKV $BUF16 &
+    MODES=$PERF3 matrix X21_rw800k_16c_T4_SCRPV     scatter_rw     "16 50000 32 8"  16 X86O3CPU $KN_T4 $SL $CG $RG $PC $ACKV $BUF16 &
+    wait
+    MODES=$PERF3 matrix X23_rw800k_16c_T4_SC90RPV   scatter_rw     "16 50000 32 8"  16 X86O3CPU $KN_T4 $SL $CG90 $RG $PC $ACKV $BUF16 &
+    MODES=$PERF3 matrix X19_phased512_16c_R4_CRP    scatter_phased "16 25 512 8"    16 X86O3CPU $KN_R4 $CG $RG $PC $BUF16 &
+    wait ;;
+  rejectd)
+    # GETX-served rejection that leaves retained (D) lines at the home
+    PC="DSTATE_PROMOTE_CHANGES=2"
+    matrix G59_regress_TH4_SC90RPV_o3  coherence_regression        "" 5 X86O3CPU    $KN_TH4 $SL $CG90 $RG $PC $ACKV &
+    MODES=$PERF3 matrix Y10_cms_T4_SC90R             cms_dstate     "4 20000"        4 X86O3CPU $KN_T4 $SL $CG90 $RG &
+    MODES=$PERF3 matrix Y12_rw800k_T4_SC90RPV        scatter_rw     "4 200000 32 8"  4 X86O3CPU $KN_T4 $SL $CG90 $RG $PC $ACKV &
+    wait
+    MODES=$PERF3 matrix Y13_hotkey800k_TH4_SC90R     scatter_dstate "4 200000 1"     4 X86O3CPU $KN_TH4 $SL $CG90 $RG &
+    MODES=$PERF3 matrix Y11_multi512_T4_SC90R        scatter_multi  "4 2000 512"     4 X86O3CPU $KN_T4 $SL $CG90 $RG &
+    MODES=$PERF3 matrix Y6_cms_T4_SCR                cms_dstate     "4 20000"        4 X86O3CPU $KN_T4 $SL $CG $RG &
+    wait
+    export TIMEOUT=7200
+    MODES=$PERF3 matrix Y21_rw800k_16c_T4_SCRPV      scatter_rw     "16 50000 32 8"  16 X86O3CPU $KN_T4 $SL $CG $RG $PC $ACKV $BUF16 &
+    MODES=$PERF3 matrix Y23_rw800k_16c_T4_SC90RPV    scatter_rw     "16 50000 32 8"  16 X86O3CPU $KN_T4 $SL $CG90 $RG $PC $ACKV $BUF16 &
+    wait
+    MODES=$PERF3 matrix Y19_phased512_16c_R4_CRP     scatter_phased "16 25 512 8"    16 X86O3CPU $KN_R4 $CG $RG $PC $BUF16 &
+    MODES=$PERF3 matrix Y21b_cms_16c_T4_SC90R        cms_dstate     "16 5000"        16 X86O3CPU $KN_T4 $SL $CG90 $RG $BUF16 &
+    wait ;;
+  rejectg)
+    # GETX-served rejection for the gate decision only (structural refusals NACK)
+    PC="DSTATE_PROMOTE_CHANGES=2"
+    matrix G60_regress_TH4_SC90RPV_o3  coherence_regression        "" 5 X86O3CPU    $KN_TH4 $SL $CG90 $RG $PC $ACKV &
+    matrix G61_regress_TH4_C90R_minor  coherence_regression        "" 5 X86MinorCPU $KN_TH4 $CG90 $RG &
+    MODES=$PERF3 matrix Z10_cms_T4_SC90R             cms_dstate     "4 20000"        4 X86O3CPU $KN_T4 $SL $CG90 $RG &
+    wait
+    MODES=$PERF3 matrix Z12_rw800k_T4_SC90RPV        scatter_rw     "4 200000 32 8"  4 X86O3CPU $KN_T4 $SL $CG90 $RG $PC $ACKV &
+    MODES=$PERF3 matrix Z13_hotkey800k_TH4_SC90R     scatter_dstate "4 200000 1"     4 X86O3CPU $KN_TH4 $SL $CG90 $RG &
+    MODES=$PERF3 matrix Z11_multi512_T4_SC90R        scatter_multi  "4 2000 512"     4 X86O3CPU $KN_T4 $SL $CG90 $RG &
+    wait
+    export TIMEOUT=7200
+    MODES=$PERF3 matrix Z21_rw800k_16c_T4_SCRPV      scatter_rw     "16 50000 32 8"  16 X86O3CPU $KN_T4 $SL $CG $RG $PC $ACKV $BUF16 &
+    MODES=$PERF3 matrix Z23_rw800k_16c_T4_SC90RPV    scatter_rw     "16 50000 32 8"  16 X86O3CPU $KN_T4 $SL $CG90 $RG $PC $ACKV $BUF16 &
+    wait
+    MODES=$PERF3 matrix Z22_multi512_16c_R4_C90R     scatter_multi  "16 500 512"     16 X86O3CPU $KN_R4 $CG90 $RG $BUF16 &
+    MODES=$PERF3 matrix Z21b_cms_16c_T4_SC90R        cms_dstate     "16 5000"        16 X86O3CPU $KN_T4 $SL $CG90 $RG $BUF16 &
+    wait
+    MODES=$PERF3 matrix Z19_hotkey800k_16c_TH4_SC90R scatter_dstate "16 50000 1"     16 X86O3CPU $KN_TH4 $SL $CG90 $RG $BUF16 &
+    wait ;;
+  oracle2)
+    MODES=remote,persistent matrix O8_rw800k_T4_SFSV     scatter_rw     "4 200000 32 8"  4 X86O3CPU $KN_T4 $SL $FS $ACKV &
+    MODES=remote,persistent matrix O9_hotkey800k_TH4_SFSV scatter_dstate "4 200000 1"   4 X86O3CPU $KN_TH4 $SL $FS $ACKV &
+    wait
+    export TIMEOUT=7200
+    MODES=remote,persistent matrix O10_rw800k_16c_T4_SFSV scatter_rw   "16 50000 32 8"  16 X86O3CPU $KN_T4 $SL $FS $ACKV $BUF16 &
+    wait ;;
+  oracle)
+    # speculation oracle: would local copy + delta have matched the ACK value?
+    MODES=remote,persistent matrix O0_rw800k_T4_SFSV    scatter_rw     "4 200000 32 8"  4 X86O3CPU $KN_T4 $SL $FS $ACKV &
+    MODES=remote,persistent matrix O1_hotkey800k_TH4_SFSV scatter_dstate "4 200000 1"   4 X86O3CPU $KN_TH4 $SL $FS $ACKV &
+    MODES=remote,persistent matrix O2_cms_T4_SFSV       cms_dstate     "4 20000"        4 X86O3CPU $KN_T4 $SL $FS $ACKV &
+    wait
+    export TIMEOUT=7200
+    MODES=remote,persistent matrix O3_rw800k_16c_T4_SFSV scatter_rw    "16 50000 32 8"  16 X86O3CPU $KN_T4 $SL $FS $ACKV $BUF16 &
+    MODES=remote,persistent matrix O4_hotkey800k_16c_TH4_SFSV scatter_dstate "16 50000 1" 16 X86O3CPU $KN_TH4 $SL $FS $ACKV $BUF16 &
+    wait ;;
+  all)
+    for ph in gates prune table rejectx oracle promote rejectd oracle2 rejectg; do echo "--- $ph $(date +%H:%M)"; bash "$0" v8 $ph; done ;;
+  esac ;;
 report)
   # One row per (run, mode). Update/response message counts come from the L1's terminal
   # ACK/NACK counters (Garnet emits no per-size-class msg_count); newBytes uses the derived

@@ -398,10 +398,10 @@ index 848d164..f997a5a 100644
    PacketPtr pkt,             desc="Packet associated with this request";
 diff --git a/src/mem/ruby/structures/DStateEngine.hh b/src/mem/ruby/structures/DStateEngine.hh
 new file mode 100644
-index 0000000..338fe6e
+index 0000000..4acd5db
 --- /dev/null
 +++ b/src/mem/ruby/structures/DStateEngine.hh
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,218 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Finite-capacity bank executor reference model, not a synthesized datapath.
 +// Capacity, initiation interval, service latencies and the hot-word buffer are
@@ -467,174 +467,75 @@ index 0000000..338fe6e
 +class DStateEngine
 +{
 +  public:
-+    // Admission-gate bookkeeping: a bounded per-bank table, line -> {bitmap of
-+    // requester node ids, updates and would-be ownership changes in a decayed
-+    // window, last writer, last access cycle}. It is kept outside the cache entry
-+    // because a line the home does not hold has no entry, yet its rejected
-+    // writers must still be counted. When the table is full the oldest entry is
-+    // dropped (that line starts as single-writer again).
++    // Change-rate admission gate: a bounded per-bank table, line -> {updates and
++    // would-be ownership changes in a decayed window, last writer, last access
++    // cycle}. It is kept outside the cache entry because a line the home does
++    // not hold has no entry, yet its accesses must still be counted. When the
++    // table is full the oldest entry is dropped (that line starts over).
 +    //
 +    // A "change" is an access by a core other than the line's previous writer:
 +    // in conventional mode that is a GETX from a non-owner (a migration); in
 +    // delegated mode it is the update that would have migrated the line had it
 +    // not been delegated. Counting both ways keeps the signal alive while the
-+    // line is delegated, when there are no migrations to observe.
-+    struct WriterEntry {
-+        std::uint64_t bits = 0;
-+        int epochUpdates = 0;          // updates since the bitmap last restarted
++    // line is delegated, when there are no migrations to observe. The owner's
++    // local hits are invisible to the home, so the ratio is an upper bound.
++    struct GateEntry {
 +        int updates = 0, changes = 0;  // decayed window (halved every epoch updates)
 +        int lastWriter = -1;
 +        std::uint64_t lastCycle = 0, age = 0;
 +    };
-+    static constexpr std::size_t kWriterTable = 1024;
-+    std::unordered_map<std::uint64_t, WriterEntry> writers;
-+    std::uint64_t writerClock = 0;
-+    enum AccessKind { Rejected = 0, Accepted = 1, Migration = 2 };
++    std::unordered_map<std::uint64_t, GateEntry> gate;
++    std::uint64_t gateClock = 0;
 +
-+    // Per-bank adaptive threshold (gatePct): decisions in the current window and
-+    // the mean change ratio of the rejected ones.
-+    struct Adaptive {
-+        int pct = -1, configured = 0, accepts = 0, rejects = 0, cooloff = 0;
-+        long rejRatioSum = 0;
-+    } adaptive;
-+    static constexpr int kAdaptiveWindow = 1024, kAdaptiveStep = 10, kAdaptiveCooloff = 8, kAdaptiveFloor = 10;
-+
-+    bool expired(const WriterEntry &e, std::uint64_t now, std::uint64_t idle) const
++    bool expired(const GateEntry &e, std::uint64_t now, std::uint64_t idle) const
 +    {
 +        return idle > 0 && now > e.lastCycle && now - e.lastCycle > idle;
 +    }
-+    const WriterEntry *lookup(std::uint64_t line, std::uint64_t now, std::uint64_t idle) const
++    const GateEntry *lookup(std::uint64_t line, std::uint64_t now, std::uint64_t idle) const
 +    {
-+        auto it = writers.find(line);
-+        return it == writers.end() || expired(it->second, now, idle) ? nullptr : &it->second;
++        auto it = gate.find(line);
++        return it == gate.end() || expired(it->second, now, idle) ? nullptr : &it->second;
 +    }
-+    static int popcount(std::uint64_t bits)
-+    {
-+        int n = 0;
-+        for (; bits; bits &= bits - 1) ++n;
-+        return n;
-+    }
-+    static int changePctOf(const WriterEntry &e, int node)
++    static int changePctOf(const GateEntry &e, int node)
 +    {
 +        return (e.changes + (e.lastWriter != node ? 1 : 0)) * 100 / (e.updates + 1);
-+    }
-+
-+    // Distinct writers of `line` once `node` is counted (no state change).
-+    int writersAfter(std::uint64_t line, int node, std::uint64_t now, std::uint64_t idle) const
-+    {
-+        const WriterEntry *e = lookup(line, now, idle);
-+        std::uint64_t bits = e ? e->bits : 0;
-+        if (node >= 0 && node < 64) bits |= std::uint64_t(1) << node;
-+        return popcount(bits);
 +    }
 +    // Would-be ownership changes in the window once `node`'s access is counted.
 +    int changesAfter(std::uint64_t line, int node, std::uint64_t now, std::uint64_t idle) const
 +    {
-+        const WriterEntry *e = lookup(line, now, idle);
++        const GateEntry *e = lookup(line, now, idle);
 +        return (e ? e->changes : 0) + ((e ? e->lastWriter : -1) != node ? 1 : 0);
 +    }
 +    // Changes per hundred updates in the window once `node`'s access is counted.
 +    int changePct(std::uint64_t line, int node, std::uint64_t now, std::uint64_t idle) const
 +    {
-+        const WriterEntry *e = lookup(line, now, idle);
++        const GateEntry *e = lookup(line, now, idle);
 +        return e ? changePctOf(*e, node) : 100;
 +    }
 +    // Record one access from `node`: a delegated update (accepted or rejected) or
-+    // a conventional GETX. The bitmap restarts every `epoch` updates (idle == 0)
-+    // or after `idle` quiet cycles (idle > 0); the window counters halve every
-+    // `epoch` updates and clear after an idle gap, so a steadily contested line
-+    // keeps a steady ratio and never bounces between modes.
-+    void noteAccess(std::uint64_t line, int node, std::uint64_t now, int epoch, std::uint64_t idle, int kind)
++    // a conventional GETX. The window counters halve every `epoch` updates and
++    // clear after an idle gap of `idle` cycles (0: never), so a steadily
++    // contested line keeps a steady ratio and never bounces between modes. The
++    // table holds at most `table` lines (<= 0: 1024).
++    void noteAccess(std::uint64_t line, int node, std::uint64_t now, int epoch, std::uint64_t idle, int table)
 +    {
-+        if (writers.size() >= kWriterTable && !writers.count(line)) {
-+            auto victim = writers.begin();
-+            for (auto it = writers.begin(); it != writers.end(); ++it)
++        std::size_t cap = table > 0 ? std::size_t(table) : 1024;
++        if (gate.size() >= cap && !gate.count(line)) {
++            auto victim = gate.begin();
++            for (auto it = gate.begin(); it != gate.end(); ++it)
 +                if (it->second.age < victim->second.age) victim = it;
-+            writers.erase(victim);
++            gate.erase(victim);
 +        }
-+        WriterEntry &e = writers[line];
-+        if (expired(e, now, idle)) e = WriterEntry();
-+        if (kind != Migration) noteDecision(kind == Accepted, changePctOf(e, node));
++        GateEntry &e = gate[line];
++        if (expired(e, now, idle)) e = GateEntry();
 +        if (e.lastWriter != node) ++e.changes;
 +        e.lastWriter = node;
 +        if (++e.updates >= epoch) { e.updates = (e.updates + 1) / 2; e.changes = (e.changes + 1) / 2; }
-+        if (idle == 0 && ++e.epochUpdates >= epoch) { e.bits = 0; e.epochUpdates = 0; }
-+        if (node >= 0 && node < 64) e.bits |= std::uint64_t(1) << node;
 +        e.lastCycle = now;
-+        e.age = ++writerClock;
++        e.age = ++gateClock;
 +    }
-+    void forgetWriters(std::uint64_t line) { writers.erase(line); }
++    void forgetGate(std::uint64_t line) { gate.erase(line); }
 +
-+    // Requester-side owner-tenure predictor (used by the L1): how many adds this
-+    // L1 performed on a line while owning it before the line was taken away. A
-+    // short last tenure means the line is contended enough that delegation beats
-+    // ownership; a long one means the owner would have hit locally. This is the
-+    // owner hit rate, which the home never observes. Bounded table, oldest dropped.
-+    struct TenureEntry { int current = 0, last = -1; std::uint64_t lastCycle = 0, age = 0; };
-+    static constexpr std::size_t kTenureTable = 1024;
-+    std::unordered_map<std::uint64_t, TenureEntry> tenures;
-+    std::uint64_t tenureClock = 0;
-+
-+    TenureEntry &tenureSlot(std::uint64_t line)
-+    {
-+        if (tenures.size() >= kTenureTable && !tenures.count(line)) {
-+            auto victim = tenures.begin();
-+            for (auto it = tenures.begin(); it != tenures.end(); ++it)
-+                if (it->second.age < victim->second.age) victim = it;
-+            tenures.erase(victim);
-+        }
-+        TenureEntry &e = tenures[line];
-+        e.age = ++tenureClock;
-+        return e;
-+    }
-+    void noteOwnerAdd(std::uint64_t line) { ++tenureSlot(line).current; }
-+    void noteOwnershipLost(std::uint64_t line, std::uint64_t now)
-+    {
-+        TenureEntry &e = tenureSlot(line);
-+        e.last = e.current;
-+        e.current = 0;
-+        e.lastCycle = now;
-+    }
-+    // The last observed tenure of `line`, or -1 when unknown or expired
-+    // (idle > 0 and recorded more than idle cycles ago).
-+    int predictedTenure(std::uint64_t line, std::uint64_t now, std::uint64_t idle) const
-+    {
-+        auto it = tenures.find(line);
-+        if (it == tenures.end() || it->second.last < 0) return -1;
-+        if (idle > 0 && now > it->second.lastCycle && now - it->second.lastCycle > idle) return -1;
-+        return it->second.last;
-+    }
-+
-+    // Adaptive threshold: the effective change-ratio threshold for this bank.
-+    // Every kAdaptiveWindow decisions, if rejections dominate (>= 4x accepts) and
-+    // the rejected requests were contested (mean ratio >= half the threshold),
-+    // the threshold steps down; when accepts dominate it steps back up toward the
-+    // configured value. A cooling-off period of kAdaptiveCooloff windows follows
-+    // every step so an isolated burst cannot walk the threshold away.
-+    int gatePct(int configured, bool enabled)
-+    {
-+        if (!enabled) return configured;
-+        adaptive.configured = configured;
-+        if (adaptive.pct < 0) adaptive.pct = configured;
-+        return adaptive.pct;
-+    }
-+    void noteDecision(bool accepted, int ratio)
-+    {
-+        if (adaptive.pct < 0) return;    // adaptation off or not yet queried
-+        if (accepted) ++adaptive.accepts; else { ++adaptive.rejects; adaptive.rejRatioSum += ratio; }
-+        if (adaptive.accepts + adaptive.rejects < kAdaptiveWindow) return;
-+        if (adaptive.cooloff > 0) {
-+            --adaptive.cooloff;
-+        } else if (adaptive.rejects >= 4 * adaptive.accepts && adaptive.rejects > 0 &&
-+                   adaptive.rejRatioSum / adaptive.rejects >= adaptive.pct / 2 &&
-+                   adaptive.pct - kAdaptiveStep >= kAdaptiveFloor) {
-+            adaptive.pct -= kAdaptiveStep; adaptive.cooloff = kAdaptiveCooloff;
-+        } else if (adaptive.accepts >= 4 * adaptive.rejects && adaptive.pct < adaptive.configured) {
-+            adaptive.pct = std::min(adaptive.configured, adaptive.pct + kAdaptiveStep);
-+            adaptive.cooloff = kAdaptiveCooloff;
-+        }
-+        adaptive.accepts = adaptive.rejects = 0; adaptive.rejRatioSum = 0;
-+    }
 +    // One request's own masks must not claim a byte at both widths.
 +    bool masksValid(int m32, int m64) const
 +    {
@@ -787,10 +688,15 @@ index 0000000..5a1b144
 +} // namespace gem5::ruby
 +#endif
 diff --git a/src/mem/ruby/system/Sequencer.cc b/src/mem/ruby/system/Sequencer.cc
-index ec9b417..91c9f56 100644
+index ec9b417..a6ffe23 100644
 --- a/src/mem/ruby/system/Sequencer.cc
 +++ b/src/mem/ruby/system/Sequencer.cc
-@@ -42,6 +42,9 @@
+@@ -39,9 +39,14 @@
+  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++#include <algorithm>
++
  #include "mem/ruby/system/Sequencer.hh"
  
  #include "base/logging.hh"
@@ -800,7 +706,7 @@ index ec9b417..91c9f56 100644
  #include "cpu/testers/rubytest/RubyTester.hh"
  #include "debug/LLSC.hh"
  #include "debug/ProtocolTrace.hh"
-@@ -72,6 +75,10 @@ Sequencer::Sequencer(const Params &p)
+@@ -72,6 +77,10 @@ Sequencer::Sequencer(const Params &p)
  
      m_dataCache_ptr = p.dcache;
      m_max_outstanding_requests = p.max_outstanding_requests;
@@ -811,7 +717,20 @@ index ec9b417..91c9f56 100644
      m_deadlock_threshold = p.deadlock_threshold;
  
      m_coreId = p.coreid; // for tracking the two CorePair sequencers
-@@ -494,7 +501,7 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
+@@ -89,6 +98,12 @@ Sequencer::Sequencer(const Params &p)
+     // The profiler will collate these across different
+     // sequencers and display those collated statistics.
+     m_outstandReqHist.init(10);
++    m_dstateSpecRight.name(name() + ".dstate_spec_right")
++        .desc("delegated adds whose ACK value equalled local copy + delta");
++    m_dstateSpecWrong.name(name() + ".dstate_spec_wrong")
++        .desc("delegated adds whose ACK value differed from local copy + delta");
++    m_dstateSpecNoCopy.name(name() + ".dstate_spec_nocopy")
++        .desc("delegated adds with a valued ACK but no local copy to predict from");
+     m_latencyHist.init(10);
+     m_hitLatencyHist.init(10);
+     m_missLatencyHist.init(10);
+@@ -494,7 +509,7 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
              // Do not process follow-up requests
              // (e.g. if full line no present)
              // Reissue to the cache hierarchy
@@ -820,7 +739,7 @@ index ec9b417..91c9f56 100644
              break;
          }
  
-@@ -587,7 +594,8 @@ Sequencer::processReadCallback(SequencerRequest &seq_req,
+@@ -587,7 +602,8 @@ Sequencer::processReadCallback(SequencerRequest &seq_req,
          (seq_req.m_type != RubyRequestType_IFETCH) &&
          (seq_req.m_type != RubyRequestType_REPLACEMENT)) {
          // Write request: reissue request to the cache hierarchy
@@ -830,17 +749,18 @@ index ec9b417..91c9f56 100644
          return true;
      }
      return false;
-@@ -655,6 +663,9 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
+@@ -655,6 +671,10 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
      assert(address == makeLineAddress(address));
      assert(m_RequestTable.find(address) != m_RequestTable.end());
      auto &seq_req_list = m_RequestTable[address];
 +    // Applied locally: only the front request's own functor is executed below,
 +    // so a combined operand sent with it is void and the others are re-issued.
 +    m_dstateCombined.erase(address);
++    m_dstateSpec.erase(address);
  
      // Perform hitCallback only on the first cpu request that
      // issued the ruby request
-@@ -674,7 +685,7 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
+@@ -674,7 +694,7 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
              // Read, Write or Atomic request:
              // reissue request to the cache hierarchy
              // (we don't know if op was performed remotly)
@@ -849,10 +769,38 @@ index ec9b417..91c9f56 100644
              break;
          }
  
-@@ -695,6 +706,187 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
+@@ -695,6 +715,234 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
      }
  }
  
++void
++Sequencer::recordSpeculation(Addr line, const std::list<SequencerRequest> &requests, int count)
++{
++    // Predict the front add's word as the request will leave it: the copy this
++    // L1 holds plus every add to that word folded into this request. Wrong
++    // whenever another core's update reaches the home first, which is the
++    // measurement.
++    m_dstateSpec.erase(line);
++    if (!m_dataCache_ptr || !m_dataCache_ptr->isTagPresent(line))
++        return;
++    AbstractCacheEntry *entry = m_dataCache_ptr->lookup(line);
++    if (!entry)
++        return;
++    PacketPtr pkt = requests.front().pkt;
++    const int off = pkt->getAddr() - line, size = pkt->getSize();
++    DStateSpec spec;
++    spec.lo = pkt->getAddr();
++    spec.predicted.assign(entry->getDataBlk().getData(off, size),
++                          entry->getDataBlk().getData(off, size) + size);
++    int i = 0;
++    for (auto it = requests.begin(); it != requests.end() && i < count; ++it, ++i) {
++        if (it->pkt->isAtomicOp() && it->pkt->getAddr() == pkt->getAddr() &&
++            it->pkt->getSize() == size)
++            (*(it->pkt->getAtomicOp()))(spec.predicted.data());
++    }
++    m_dstateSpec[line] = std::move(spec);
++}
++
 +void
 +Sequencer::atomicRemoteCallback(Addr address, DataBlock &value, bool hasValue)
 +{
@@ -884,6 +832,18 @@ index ec9b417..91c9f56 100644
 +        if (i == 0) {
 +            word_lo = request.pkt->getAddr();
 +            word_hi = word_lo + request.pkt->getSize();
++            auto sp = m_dstateSpec.find(address);
++            if (hasValue) {
++                if (sp == m_dstateSpec.end() || sp->second.lo != word_lo) {
++                    m_dstateSpecNoCopy++;
++                } else if (std::equal(sp->second.predicted.begin(), sp->second.predicted.end(),
++                                      value.getData(word_lo - address, sp->second.predicted.size()))) {
++                    m_dstateSpecRight++;
++                } else {
++                    m_dstateSpecWrong++;
++                }
++            }
++            if (sp != m_dstateSpec.end()) m_dstateSpec.erase(sp);
 +        }
 +        recordMissLatency(&request, true, MachineType_NUM, true,
 +                          Cycles(0), Cycles(0), Cycles(0));
@@ -938,6 +898,8 @@ index ec9b417..91c9f56 100644
 +    if (m_dstateRequestCombine <= 1 ||
 +        front.m_type != RubyRequestType_ATOMIC_NO_RETURN ||
 +        !front.pkt->isAtomicOp()) {
++        if (front.m_type == RubyRequestType_ATOMIC_NO_RETURN && front.pkt->isAtomicOp())
++            recordSpeculation(line, requests, 1);
 +        issueRequest(front.pkt, front.m_second_type);
 +        return;
 +    }
@@ -982,6 +944,7 @@ index ec9b417..91c9f56 100644
 +        }
 +    }
 +    if (count <= 1) {
++        recordSpeculation(line, requests, 1);
 +        issueRequest(front.pkt, front.m_second_type);
 +        return;
 +    }
@@ -994,6 +957,7 @@ index ec9b417..91c9f56 100644
 +        op.operand = words.begin()->second.sum;
 +        if (frontSize == 4) op.operand &= 0xffffffffULL;
 +        wordMask(frontOff, frontSize, op);
++        recordSpeculation(line, requests, count);
 +        m_dstateCombined[line] = count;
 +        issueRequest(front.pkt, front.m_second_type, &op);
 +        return;
@@ -1011,12 +975,14 @@ index ec9b417..91c9f56 100644
 +            wordMask(w.first, w.second.size, op);
 +        }
 +        op.words = int(words.size());
++        recordSpeculation(line, requests, count);
 +        m_dstateCombined[line] = count;
 +        issueRequest(front.pkt, front.m_second_type, &op);
 +        return;
 +    }
 +    // Otherwise combine only the front word's own consecutive run.
 +    if (frontRun <= 1) {
++        recordSpeculation(line, requests, 1);
 +        issueRequest(front.pkt, front.m_second_type);
 +        return;
 +    }
@@ -1030,6 +996,7 @@ index ec9b417..91c9f56 100644
 +    if (frontSize == 4) sum &= 0xffffffffULL;
 +    op.operand = sum;
 +    wordMask(frontOff, frontSize, op);
++    recordSpeculation(line, requests, frontRun);
 +    m_dstateCombined[line] = frontRun;
 +    issueRequest(front.pkt, front.m_second_type, &op);
 +}
@@ -1037,7 +1004,7 @@ index ec9b417..91c9f56 100644
  void
  Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
                         bool llscSuccess,
-@@ -1009,7 +1201,7 @@ Sequencer::makeRequest(PacketPtr pkt)
+@@ -1009,7 +1257,7 @@ Sequencer::makeRequest(PacketPtr pkt)
      } else if (pkt->req->isTlbiCmd()) {
          primary_type = secondary_type = tlbiCmdToRubyRequestType(pkt);
          DPRINTF(RubySequencer, "Issuing TLBI\n");
@@ -1046,7 +1013,7 @@ index ec9b417..91c9f56 100644
      } else if (pkt->isAtomicOp()) {
          if (pkt->req->isAtomicReturn()){
              DPRINTF(RubySequencer, "Issuing ATOMIC RETURN \n");
-@@ -1087,7 +1279,8 @@ Sequencer::makeRequest(PacketPtr pkt)
+@@ -1087,7 +1335,8 @@ Sequencer::makeRequest(PacketPtr pkt)
  }
  
  void
@@ -1056,7 +1023,7 @@ index ec9b417..91c9f56 100644
  {
      assert(pkt != NULL);
      ContextID proc_id = pkt->req->hasContextId() ?
-@@ -1152,6 +1345,44 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
+@@ -1152,6 +1401,44 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
                                  (offset, pkt->getAtomicOp()));
  
              msg->setWriteMask(offset, pkt->getSize(), atomicOps);
@@ -1102,10 +1069,18 @@ index ec9b417..91c9f56 100644
  
          DPRINTFR(ProtocolTrace, "%15s %3s %10s%20s %6s>%-6s %#x %s\n",
 diff --git a/src/mem/ruby/system/Sequencer.hh b/src/mem/ruby/system/Sequencer.hh
-index f530eb4..8e2fcca 100644
+index f530eb4..4d0bf29 100644
 --- a/src/mem/ruby/system/Sequencer.hh
 +++ b/src/mem/ruby/system/Sequencer.hh
-@@ -60,6 +60,16 @@ namespace gem5
+@@ -44,6 +44,7 @@
+ #include <iostream>
+ #include <list>
+ #include <unordered_map>
++#include <vector>
+ 
+ #include "cpu/testers/rubytest/RubyTester.hh"
+ #include "mem/ruby/common/Address.hh"
+@@ -60,6 +61,16 @@ namespace gem5
  namespace ruby
  {
  
@@ -1122,7 +1097,7 @@ index f530eb4..8e2fcca 100644
  struct SequencerRequest
  {
      PacketPtr pkt;
-@@ -125,6 +135,8 @@ class Sequencer : public RubyPort
+@@ -125,6 +136,8 @@ class Sequencer : public RubyPort
                        const Cycles forwardRequestTime = Cycles(0),
                        const Cycles firstResponseTime = Cycles(0));
  
@@ -1131,7 +1106,7 @@ index f530eb4..8e2fcca 100644
      void atomicCallback(Addr address,
                          DataBlock& data,
                          const bool externalHit = false,
-@@ -210,7 +222,11 @@ class Sequencer : public RubyPort
+@@ -210,7 +223,11 @@ class Sequencer : public RubyPort
      { return m_IncompleteTimes[t]; }
  
    protected:
@@ -1144,7 +1119,7 @@ index f530eb4..8e2fcca 100644
      virtual void hitCallback(SequencerRequest* srequest, DataBlock& data,
                               bool llscSuccess,
                               const MachineType mach, const bool externalHit,
-@@ -242,6 +258,14 @@ class Sequencer : public RubyPort
+@@ -242,6 +259,22 @@ class Sequencer : public RubyPort
    protected:
      // RequestTable contains both read and write requests, handles aliasing
      std::unordered_map<Addr, std::list<SequencerRequest>> m_RequestTable;
@@ -1156,6 +1131,14 @@ index f530eb4..8e2fcca 100644
 +    int m_dstateRangeLoMb = 0;
 +    int m_dstateRangeHiMb = 0;
 +    std::unordered_map<Addr, int> m_dstateCombined;
++    // Speculation oracle (measurement only): the word a delegated add would
++    // produce if applied to the copy this L1 holds, checked against the ACK value.
++    struct DStateSpec { Addr lo = 0; std::vector<uint8_t> predicted; };
++    std::unordered_map<Addr, DStateSpec> m_dstateSpec;
++    void recordSpeculation(Addr line, const std::list<SequencerRequest> &requests, int count);
++    statistics::Scalar m_dstateSpecRight;
++    statistics::Scalar m_dstateSpecWrong;
++    statistics::Scalar m_dstateSpecNoCopy;
      // UnadressedRequestTable contains "unaddressed" requests,
      // guaranteed not to alias each other
      std::unordered_map<uint64_t, SequencerRequest> m_UnaddressedRequestTable;

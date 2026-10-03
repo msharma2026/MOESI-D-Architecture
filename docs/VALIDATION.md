@@ -260,6 +260,50 @@ owner hit rate but only its own, and at 16 cores reads an owner's two or three
 adds before the recall as "owner wins"; it is a 4-core refinement, not a
 general policy (round-7 section of the results page).
 
+### Round 8 (2026-10-03): pruning, cheap rejection, promotion on the gate's evidence
+
+Gates on the round-8 builds, every mode CORRECT and through the coverage gate:
+twelve regression matrices (change gate with GETX-served rejection on O3 TSO,
+Minor TSO and O3 fenced-relaxed; gate at 90 %; 256-entry table; delegate-from-S
+with ACK value; promotion on changes; the final gate-only GETX service on O3 and
+Minor) 4/4 each; litmus with the new knobs 0 forbidden. The GETX-served path is
+exercised in every matrix that enables it (`D_REQ` receives `Exclusive_Data`
+and `Ack`; L2 `L1_GETX` events on delegated requests).
+
+The pruned build reproduces round 7 bit for bit on five repeated rows (same
+simSeconds, flits, rejections, merges), which is the test that deleting the
+writer gate, the adaptive threshold and the tenure predictor removed nothing
+else. One regression the pruning did cause and the gates did not catch:
+promotion on writers (`DSTATE_PROMOTE_WRITERS`) was removed as marginal on the
+4-core rows, but the 16-core read-mixed win (1.71×) depended on it, because far
+reads only serve a line retained in D and the update-count rule rarely promotes
+a line that is read every eight adds. Caught by the round-8 16-core rows
+(+45 % instead of 1.71×) and replaced by `DSTATE_PROMOTE_CHANGES`, which
+promotes on the gate table's own evidence and reproduces the round-7 row
+exactly. Lesson recorded: a knob is marginal only on the rows it was measured
+on; every pruning needs the full 16-core set, not the 4-core subset.
+
+Cheap rejection took three versions to get right, each one measured:
+
+1. Every refusal served as the requester's GETX: CMS at 4 cores improved to a
+   near tie, but the 16-core read-mixed run lost its far reads entirely
+   (297,000 → 0) and went from 1.71× to +44 %.
+2. Retained (D) lines excluded: no change at 16 cores; the lines were being
+   taken before they were ever retained.
+3. GETX service for the gate's own decision only; structural refusals (owned
+   elsewhere mid-transition, executor or TBEs full, no L2 slot) NACK as before:
+   16-core read-mixed back to 1.71× at both gate settings, 4-core results kept.
+   The distinction is principled: the gate says "the owner should have this
+   line" (migrate now, one trip); a structural refusal says "not right now"
+   (the requester's delayed retry finds the home ready and the line stays
+   where it is). Serving the second kind as a migration turned every transient
+   refusal into a line movement, which at 16 cores is most refusals.
+
+The speculation oracle counts predictions at every delegated issue, including
+the single-request paths inside the combining logic (a first version missed
+those and over-counted "no local copy"; corrected and rerun before the numbers
+were taken).
+
 ### Measurement caveats that apply to every number
 
 - **Whole-program `simSeconds`, no ROI.** `libm5` was not built, so times include

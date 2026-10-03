@@ -299,21 +299,35 @@ single-writer lines from shared ones and costs nothing at 16 cores (every line
 clears the gate), but it admits the Count-Min sketch at 4 cores, where the
 owner wins.
 
-**Owner-tenure predictor (requester side).** The L1 sees exactly what the home
-cannot: how many adds it performed on a line it owned before another core took
-it. It records that tenure when the line leaves (taken by a writer or a reader,
-or evicted), in a bounded table, and delegates only lines whose last tenure was
-at most `d_state_max_tenure`. A line it has never owned carries no evidence;
-with `d_state_tenure_probe` it is owned first so the tenure can be measured, and
-a record expires after `d_state_tenure_idle` cycles so a delegated line is
-re-probed periodically (without probing, a line that starts delegated is never
-measured again). The probe is the sampling phase: one ownership per probe
-period per line, a few migrations, after which every core has a fresh tenure
-and the line settles into whichever mode its tenure says.
+**Owner-tenure predictor (requester side) — measured and removed.** Round 7
+also built the exact signal at the L1: how many adds it performed on a line it
+owned before another core took it. It closed the sketch to a tie at 4 cores
+but read an owner's two or three adds before the recall as "owner wins" at 16
+cores, turning the hot word's 1.6× win into an 18 % loss, and it cost a
+1,024-entry table per L1. The requester's view is local by construction; the
+home's count of ownership changes is the signal that is right at both scales,
+so the predictor was removed in round 8 (results page, rounds 7–8).
 
-Neither mechanism adds a message or a message field; both are tables at a
-controller plus a comparison on the existing admission path, and the predictor
-only ever downgrades a delegation to the ordinary GETX path.
+**Cheap rejection.** A rejected delegated update used to cost a NACK round trip
+and then the requester's own GETX round trip. With `d_state_reject_as_getx`
+the home serves the rejected request *as* that GETX: the line goes to the
+requester exclusive through the ordinary path (forwarded to the owner, acks
+counted) and the L1, still holding the operation, applies it on arrival exactly
+as after a fallback GETX. One trip instead of two, no new message. Only the gate's own decision is
+served this way. A line retained in D, a structural refusal (owned elsewhere
+mid-transition, executor or TBEs full, no L2 slot), a malformed request and
+forced-NACK testing keep the NACK: those refusals are transient, the
+requester's delayed retry finds the home ready, and serving them as a GETX
+would migrate a line the home is about to accept (measured: it took the
+16-core read-mixed run from 1.71× to +44 %). Rejection being cheap is what makes
+a strict gate affordable: the gate can refuse a line it is unsure about and the
+cost of being wrong is a migration, not a migration plus a NACK. Retention
+follows the same evidence: `d_state_promote_changes` keeps a line in D once the
+gate table has seen that many ownership changes for it, so far reads engage on
+read-mixed lines without waiting for the update-count rule.
+
+Neither mechanism adds a message or a message field; the gate is a table at the
+home plus a comparison on the existing admission path.
 
 ## 5. Open implementation obligations
 

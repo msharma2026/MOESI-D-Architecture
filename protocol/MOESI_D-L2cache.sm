@@ -73,13 +73,7 @@ machine(MachineType:L2Cache, "Token protocol")
   // a victim (as an L1 GETX does) instead of rejecting into a migration. Default
   // off (reject, as shipped).
   bool d_state_evict_for_delegate := "False";
-  // Admission gate: accept a delegated update only once at least min_writers
-  // DISTINCT cores have written the line in the current epoch (writer_epoch
-  // updates, accepted or rejected); otherwise reject it, and the requester takes
-  // the line by the ordinary GETX path and owns it. The epoch gives the exit: a
-  // line that goes quiet or single-writer is rejected again and ownership
-  // resumes. 0 disables the gate (accept everything, as before).
-  int d_state_min_writers := 0;
+  // Epoch of updates after which the change-rate gate halves its counters.
   int d_state_writer_epoch := 64;
   // Change-rate gate: admit when the line's would-be ownership changes per
   // hundred updates (GETX from a non-owner when conventional, update from a core
@@ -91,10 +85,21 @@ machine(MachineType:L2Cache, "Token protocol")
   // Time-based decay of the gate table: a line idle for this many cycles
   // restarts as single-writer (0: the update-count epoch resets the bitmap).
   int d_state_writer_idle := 0;
-  // Per-bank adaptation of d_state_min_change_pct with a cooling-off period.
-  bool d_state_adaptive_gate := "False";
-  // Promotion to D on distinct writers in the epoch (0: the update-count rule).
-  int d_state_promote_writers := 0;
+  // Lines the gate table tracks per bank (hardware-sized; see ARCHITECTURE 4a).
+  int d_state_gate_table := 1024;
+  // Serve a delegated update the admission gate refuses as the requester's GETX
+  // instead of a NACK: the line goes to the requester exclusive and it applies
+  // the retained operation on arrival, one trip instead of NACK + GETX. Only the
+  // gate's own decision ("the owner should have this line") is served this way;
+  // a line retained in D, a structural refusal (owned elsewhere mid-transition,
+  // executor or TBEs full, no L2 slot), a malformed request and forced-NACK
+  // testing all keep the NACK, because those refusals are transient and serving
+  // them would migrate a line the home is about to accept.
+  bool d_state_reject_as_getx := "False";
+  // Promote to D (retain the line) once the gate table shows this many would-be
+  // ownership changes for the line, instead of waiting for the update-count
+  // rule; far reads only engage on a retained line. 0: the update-count rule.
+  int d_state_promote_changes := 0;
   // The terminal ACK carries the updated word (16 B response class) so the
   // requester can complete a load of that word that is waiting behind the add.
   bool d_state_ack_value := "False";
@@ -373,9 +378,6 @@ machine(MachineType:L2Cache, "Token protocol")
 
   bool dstateWouldPromote(Entry ce, MachineID req) {
     if (d_state_persistence == false || is_invalid(ce)) { return false; }
-    // With d_state_promote_writers the in_port decides on the writer bitmap
-    // (it can see the engine helpers); this count rule is then unused.
-    if (d_state_promote_writers > 0) { return false; }
     if (ce.DStateReqCount + 1 < d_state_hot_threshold) { return false; }
     return ce.DStateMultipleRequesters ||
            (ce.DStateSeenRequester && ce.DStateFirstRequester != req);
@@ -954,22 +956,16 @@ machine(MachineType:L2Cache, "Token protocol")
           // absorb this update. Addition is associative, so one read-modify-write
           // with the summed operand is exact; the requester is recorded and gets
           // its own terminal ACK. No executor slot or TBE is consumed.
-          // Admission gate on distinct writers (see d_state_min_writers). A line
-          // the home has no entry for counts as single-writer: it starts owned.
-          bool few_writers := false;
-          if (d_state_min_writers > 0) {
-            few_writers := dStateEngine.writersAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor),
-                                                     curCycle(), d_state_writer_idle) < d_state_min_writers;
-          }
-          // Change-rate gate (see d_state_min_change_pct): too few would-be
-          // ownership changes, or too small a share of the line's updates.
+          // Change-rate admission gate (see d_state_min_change_pct): too few
+          // would-be ownership changes, or too small a share of the line's updates.
+          bool gate_reject := false;
           if (d_state_min_change_pct > 0) {
-            int gate_pct := dStateEngine.gatePct(d_state_min_change_pct, d_state_adaptive_gate);
+            int gate_pct := d_state_min_change_pct;
             if (dStateEngine.changesAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor),
                                           curCycle(), d_state_writer_idle) < d_state_min_changes ||
                 dStateEngine.changePct(in_msg.addr, machineIDToNodeID(in_msg.Requestor),
                                        curCycle(), d_state_writer_idle) < gate_pct) {
-              few_writers := true;
+              gate_reject := true;
             }
           }
           TBE ptbe := TBEs[in_msg.addr];
@@ -985,14 +981,21 @@ machine(MachineType:L2Cache, "Token protocol")
             trigger(Event:DState_Merge, in_msg.addr, ce, TBEs[in_msg.addr]);
           } else if (busy && d_state_busy_stall) {
             trigger(Event:DState_Busy, in_msg.addr, ce, TBEs[in_msg.addr]);
-          } else if (few_writers) {
-            trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);
+          } else if (gate_reject) {
+            if (d_state_reject_as_getx && st != State:D) {
+              trigger(Event:L1_GETX, in_msg.addr, ce, TBEs[in_msg.addr]);
+            } else {
+              trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);
+            }
           } else if (owner_ok && d_state_queue_stall &&
                      dStateEngine.hasCapacity(d_state_queue_depth) == false) {
             trigger(Event:DState_Full, in_msg.addr, ce, TBEs[in_msg.addr]);
           } else if (owner_ok == false ||
               dStateEngine.hasCapacity(d_state_queue_depth) == false ||
               TBEs.areNSlotsAvailable(1, clockEdge()) == false) {
+            // Structural refusal (owned elsewhere mid-transition, executor or TBEs
+            // full): transient, so NACK and let the requester's delayed retry find
+            // the home ready; serving it as a GETX would migrate the line.
             trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);
           } else if (scalar_op && (in_msg.DStateOffset < 0 ||
                      in_msg.DStateOffset % in_msg.Len != 0 ||
@@ -1007,9 +1010,9 @@ machine(MachineType:L2Cache, "Token protocol")
           } else if (is_invalid(ce) && L2cache.cacheAvail(in_msg.addr) == false) {
             trigger(Event:DState_Reject, in_msg.addr, ce, TBEs[in_msg.addr]);
           } else if (dstateWouldPromote(ce, in_msg.Requestor) || st == State:D ||
-                     (d_state_promote_writers > 0 && d_state_persistence &&
-                      dStateEngine.writersAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor),
-                                                curCycle(), d_state_writer_idle) >= d_state_promote_writers)) {
+                     (d_state_promote_changes > 0 && d_state_persistence &&
+                      dStateEngine.changesAfter(in_msg.addr, machineIDToNodeID(in_msg.Requestor),
+                                                curCycle(), d_state_writer_idle) >= d_state_promote_changes)) {
             trigger(Event:DState_Hot, in_msg.addr, ce, TBEs[in_msg.addr]);
           } else {
             trigger(Event:DState_Cold, in_msg.addr, ce, TBEs[in_msg.addr]);
@@ -1915,13 +1918,13 @@ machine(MachineType:L2Cache, "Token protocol")
   action(d_noteWriter, "dwriter", desc="Record a rejected delegated update in the gate table") {
     peek(L1requestNetwork_in, RequestMsg) {
       dStateEngine.noteAccess(address, machineIDToNodeID(in_msg.Requestor), curCycle(),
-                              d_state_writer_epoch, d_state_writer_idle, 0);
+                              d_state_writer_epoch, d_state_writer_idle, d_state_gate_table);
     }
   }
   action(d_noteMigration, "dmigr", desc="Record a conventional ownership transfer in the gate table") {
     peek(L1requestNetwork_in, RequestMsg) {
       dStateEngine.noteAccess(address, machineIDToNodeID(in_msg.Requestor), curCycle(),
-                              d_state_writer_epoch, d_state_writer_idle, 2);
+                              d_state_writer_epoch, d_state_writer_idle, d_state_gate_table);
     }
   }
   action(d_reject, "drej", desc="Reject before application") {
@@ -1971,7 +1974,7 @@ machine(MachineType:L2Cache, "Token protocol")
       }
       tbe.DStateMerged.add(in_msg.Requestor, in_msg.DStateId);
       dStateEngine.noteAccess(address, machineIDToNodeID(in_msg.Requestor), curCycle(),
-                              d_state_writer_epoch, d_state_writer_idle, 1);
+                              d_state_writer_epoch, d_state_writer_idle, d_state_gate_table);
     }
   }
   action(d_start, "dstart", desc="Charge service time; successive starts are spaced by the initiation interval") {
@@ -2018,7 +2021,7 @@ machine(MachineType:L2Cache, "Token protocol")
       cache_entry.DStateReqCount := cache_entry.DStateReqCount + 1;
     }
     dStateEngine.noteAccess(address, machineIDToNodeID(tbe.DStateOrig), curCycle(),
-                            d_state_writer_epoch, d_state_writer_idle, 1);
+                            d_state_writer_epoch, d_state_writer_idle, d_state_gate_table);
     cache_entry.DStateReadRun := 0;
     tbe.DStateHasOp := false;
   }

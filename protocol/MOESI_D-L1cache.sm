@@ -52,16 +52,6 @@ machine(MachineType:L1Cache, "L1 cache protocol")
    // invalidates the stale sharer bit before applying; a NACK falls back to the
    // ordinary GETX path as usual. Default off.
    bool d_state_delegate_from_s := "False";
-   // Requester-side owner-tenure predictor: delegate a line only when, the last
-   // time this L1 owned it, it performed at most d_state_max_tenure adds before
-   // losing it (lines never owned are delegated). 0 disables. A recorded tenure
-   // expires after d_state_tenure_idle cycles (0: never).
-   int d_state_max_tenure := 0;
-   int d_state_tenure_idle := 0;
-   // Probe: a line with no recorded tenure (never owned here, or the record
-   // expired) is owned first so its tenure can be measured; without probing
-   // such lines are delegated and, once delegated, never measured again.
-   bool d_state_tenure_probe := "False";
 
    // Message Queues
    // From this node's L1 cache TO the network
@@ -184,7 +174,6 @@ machine(MachineType:L1Cache, "L1 cache protocol")
   }
 
   Tick clockEdge();
-  Cycles curCycle();
   Tick cyclesToTicks(Cycles c);
   void set_cache_entry(AbstractCacheEntry b);
   void unset_cache_entry();
@@ -320,22 +309,13 @@ machine(MachineType:L1Cache, "L1 cache protocol")
 
   // localOnly: the sequencer's static-placement range (oracle runs) excludes this
   // add; it takes the conventional ownership path like DSTATE_ENABLED=0 would.
-  // Owner-tenure predictor (d_state_max_tenure): a line this L1 kept for more
-  // than the threshold adds last time is taken by the ordinary GETX path.
-  bool tenureAllowsDelegation(Addr addr) {
-    if (d_state_max_tenure == 0) { return true; }
-    int tenure := dStateRequests.predictedTenure(addr, curCycle(), d_state_tenure_idle);
-    if (tenure < 0) { return d_state_tenure_probe == false; }
-    return tenure <= d_state_max_tenure;
-  }
-
-  Event mandatory_request_type_to_event(RubyRequestType type, bool localOnly, Addr addr) {
+  Event mandatory_request_type_to_event(RubyRequestType type, bool localOnly) {
     if (type == RubyRequestType:LD) {
       return Event:Load;
     } else if (type == RubyRequestType:IFETCH) {
       return Event:Ifetch;
     } else if (type == RubyRequestType:ATOMIC_NO_RETURN) {
-      if (d_state_enabled && localOnly == false && tenureAllowsDelegation(addr)) { return Event:DStateReq_CPU; }
+      if (d_state_enabled && localOnly == false) { return Event:DStateReq_CPU; }
       return Event:LocalAtomic_CPU;
     } else if ((type == RubyRequestType:ST) || (type == RubyRequestType:ATOMIC) ||
                (type == RubyRequestType:ATOMIC_RETURN)) {
@@ -468,7 +448,7 @@ machine(MachineType:L1Cache, "L1 cache protocol")
           Entry L1Icache_entry := getL1ICacheEntry(in_msg.LineAddress);
           if (is_valid(L1Icache_entry)) {
             // The tag matches for the L1, so the L1 asks the L2 for it.
-            trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly, in_msg.LineAddress),
+            trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly),
                     in_msg.LineAddress, L1Icache_entry,
                     TBEs[in_msg.LineAddress]);
           } else {
@@ -482,7 +462,7 @@ machine(MachineType:L1Cache, "L1 cache protocol")
             }
             if (L1Icache.cacheAvail(in_msg.LineAddress)) {
               // L1 does't have the line, but we have space for it in the L1 so let's see if the L2 has it
-              trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly, in_msg.LineAddress),
+              trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly),
                       in_msg.LineAddress, L1Icache_entry,
                       TBEs[in_msg.LineAddress]);
             } else {
@@ -505,12 +485,12 @@ machine(MachineType:L1Cache, "L1 cache protocol")
             State dst := getState(TBEs[in_msg.LineAddress], L1Dcache_entry, in_msg.LineAddress);
             if (in_msg.Type == RubyRequestType:ATOMIC_NO_RETURN && d_state_enabled &&
                 d_state_delegate_from_s && in_msg.DStateLocalOnly == false &&
-                tenureAllowsDelegation(in_msg.LineAddress) && dst == State:S) {
+                dst == State:S) {
               // Hold read-only: delegate rather than upgrade (knob).
               trigger(Event:DStateReq_CPU_S, in_msg.LineAddress, L1Dcache_entry,
                       TBEs[in_msg.LineAddress]);
             } else {
-              trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly, in_msg.LineAddress),
+              trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly),
                       in_msg.LineAddress, L1Dcache_entry,
                       TBEs[in_msg.LineAddress]);
             }
@@ -525,7 +505,7 @@ machine(MachineType:L1Cache, "L1 cache protocol")
             }
             if (L1Dcache.cacheAvail(in_msg.LineAddress)) {
               // L1 does't have the line, but we have space for it in the L1 let's see if the L2 has it
-              trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly, in_msg.LineAddress),
+              trigger(mandatory_request_type_to_event(in_msg.Type, in_msg.DStateLocalOnly),
                       in_msg.LineAddress, L1Dcache_entry,
                       TBEs[in_msg.LineAddress]);
             } else {
@@ -1022,11 +1002,6 @@ machine(MachineType:L1Cache, "L1 cache protocol")
     assert(is_valid(cache_entry));
     sequencer.atomicCallback(address, cache_entry.DataBlk);
     cache_entry.Dirty := true;
-    dStateRequests.noteOwnerAdd(address);
-  }
-
-  action(d_noteOwnershipLost, "dlost", desc="Record this L1's owner tenure of a line it is giving up") {
-    dStateRequests.noteOwnershipLost(address, curCycle());
   }
 
 
@@ -1232,7 +1207,6 @@ machine(MachineType:L1Cache, "L1 cache protocol")
   }
 
   transition(O, L1_Replacement, OI) {
-    d_noteOwnershipLost;
     i_allocateTBE;
     dd_issuePUTO;
     forward_eviction_to_cpu;
@@ -1240,7 +1214,6 @@ machine(MachineType:L1Cache, "L1 cache protocol")
   }
 
   transition(O, Fwd_GETX, I) {
-    d_noteOwnershipLost;
     ee_sendDataExclusive;
     forward_eviction_to_cpu;
     l_popForwardQueue;
@@ -1265,7 +1238,6 @@ machine(MachineType:L1Cache, "L1 cache protocol")
   }
 
   transition(MM, L1_Replacement, MI) {
-    d_noteOwnershipLost;
     i_allocateTBE;
     d_issuePUTX;
     forward_eviction_to_cpu;
@@ -1273,14 +1245,12 @@ machine(MachineType:L1Cache, "L1 cache protocol")
   }
 
   transition(MM, Fwd_GETX, I) {
-    d_noteOwnershipLost;
     ee_sendDataExclusive;
     forward_eviction_to_cpu;
     l_popForwardQueue;
   }
 
   transition(MM, Fwd_GETS, I) {
-    d_noteOwnershipLost;
     ee_sendDataExclusive;
     forward_eviction_to_cpu;
     l_popForwardQueue;
@@ -1306,7 +1276,6 @@ machine(MachineType:L1Cache, "L1 cache protocol")
   }
 
   transition(M, L1_Replacement, MI) {
-    d_noteOwnershipLost;
     i_allocateTBE;
     d_issuePUTX;
     forward_eviction_to_cpu;
@@ -1314,7 +1283,6 @@ machine(MachineType:L1Cache, "L1 cache protocol")
   }
 
   transition(M, Fwd_GETX, I) {
-    d_noteOwnershipLost;
     // e_sendData;
     ee_sendDataExclusive;
     forward_eviction_to_cpu;
@@ -1322,7 +1290,6 @@ machine(MachineType:L1Cache, "L1 cache protocol")
   }
 
   transition(M, Fwd_GETS, O) {
-    d_noteOwnershipLost;
     e_sendData;
     l_popForwardQueue;
   }
@@ -1568,6 +1535,34 @@ machine(MachineType:L1Cache, "L1 cache protocol")
   transition(D_RETRY, DState_Retry, IM_AMO) {
     b_issueDStateFallbackGETX;
     d_cancelFallbackTimer;
+  }
+
+  // Rejection served as a GETX (d_state_reject_as_getx at the home): instead of a
+  // NACK the line arrives exclusive, with the acks the ordinary GETX path counts,
+  // and the retained operation is applied locally on completion (OM_AMO ->
+  // MM_W), exactly as after a fallback GETX. The sequencer applies the front
+  // request's own functor and re-issues any it had combined (atomicCallback).
+  transition(D_REQ, Ack) {
+    m_decrementNumberOfMessages;
+    o_checkForCompletion;
+    n_popResponseQueue;
+  }
+  transition(D_REQ, {Exclusive_Data, Data}, OM_AMO) {
+    u_writeDataToCache;
+    m_decrementNumberOfMessages;
+    o_checkForCompletion;
+    n_popResponseQueue;
+  }
+  transition(D_REQ_S, Ack) {
+    m_decrementNumberOfMessages;
+    o_checkForCompletion;
+    n_popResponseQueue;
+  }
+  transition(D_REQ_S, {Data, Exclusive_Data}, OM_AMO) {
+    u_writeDataToCache;
+    m_decrementNumberOfMessages;
+    o_checkForCompletion;
+    n_popResponseQueue;
   }
 
   transition({D_REQ, D_RETRY}, Inv) {

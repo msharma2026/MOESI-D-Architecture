@@ -6,6 +6,25 @@ by [`paper/MOESI-D Paper.pdf`](../paper/MOESI-D%20Paper.pdf). The PDF is kept
 unchanged because that DOI points to it. This page lists what in it no longer
 holds, what changed in the implementation, and where the current evidence is.
 
+## Round 8 (2026-10-03): pruning, cheap rejection, speculation oracle
+
+Removed, with their results kept on the results page: the distinct-writer gate
+(`DSTATE_MIN_WRITERS`, `DSTATE_WRITER_EPOCH` as its epoch; superseded by the
+change-rate gate), promotion on writers, the adaptive threshold (measured
++5.5 % vs +5.0 % without it) and the owner-tenure predictor (fixed the sketch at
+4 cores, lost the hot-word and read-mixed wins at 16, cost a 1,024-entry table
+per L1). Setting a removed knob now fails fast. Added: `DSTATE_GATE_TABLE` (the
+gate table is hardware-sized and measured at 256 entries), `DSTATE_REJECT_AS_GETX`
+(a delegated update the gate refuses is served as the requester's GETX: one trip
+instead of NACK + GETX; retained lines and structural refusals still NACK),
+`DSTATE_PROMOTE_CHANGES` (retention on the gate table's evidence, replacing
+promotion on writers, which the pruning had removed and which the 16-core
+read-mixed win turned out to need), and Sequencer statistics `dstate_spec_right/wrong/nocopy` that
+measure, without forwarding anything, whether a load behind a delegated add could
+have been served from the local copy plus the delta (the speculation oracle for
+the forwarding proposal). The pruned build reproduces round 7 bit for bit on the
+repeated rows.
+
 ## Round 7 (2026-10-02): admission by owner hit rate
 
 The distinct-writer gate of round 6 could not separate shared lines where the

@@ -39,6 +39,7 @@
 
 import math
 import os
+from m5.util import fatal
 
 import m5
 from m5.defines import buildEnv
@@ -127,25 +128,28 @@ def create_system(
     hotwords = bounded_env("DSTATE_HOTWORDS", "0", 0, 1024)
     merge_limit = bounded_env("DSTATE_MERGE_LIMIT", "0", 0, 64)
     delegate_from_s = flag_env("DSTATE_DELEGATE_FROM_S", "0")
-    # Requester-side owner-tenure predictor (L1): max adds per tenure to still delegate.
-    max_tenure = bounded_env("DSTATE_MAX_TENURE", "0", 0, 1 << 20)
-    tenure_idle = bounded_env("DSTATE_TENURE_IDLE", "0", 0, 1 << 30)
-    tenure_probe = flag_env("DSTATE_TENURE_PROBE", "0")
+    # Knobs removed in round 8 (superseded or measured not to earn their cost); a
+    # run that still sets one must not silently measure something else.
+    for removed in ("DSTATE_MIN_WRITERS", "DSTATE_PROMOTE_WRITERS", "DSTATE_ADAPTIVE_GATE",
+                    "DSTATE_MAX_TENURE", "DSTATE_TENURE_IDLE", "DSTATE_TENURE_PROBE"):
+        if os.environ.get(removed) not in (None, "", "0"):
+            fatal("%s was removed in round 8 (see docs/CHANGES.md; promotion is now "
+                  "DSTATE_PROMOTE_CHANGES)", removed)
     # O3 only: no-return atomics bypass TSO's one-store-in-flight rule (Intel
     # RAO-INT's weakly ordered contract). Software fences where it publishes.
     relaxed_amo = flag_env("DSTATE_RELAXED_AMO", "0")
     # TSO same-line batching of no-return adds (O3 only; legal under TSO).
     tso_sameline = flag_env("DSTATE_TSO_SAMELINE", "0")
     # Admission gate on distinct writers, its epoch, promotion on writers, ACK value.
-    min_writers = bounded_env("DSTATE_MIN_WRITERS", "0", 0, 64)
     writer_epoch = bounded_env("DSTATE_WRITER_EPOCH", "64", 1, 1 << 20)
-    promote_writers = bounded_env("DSTATE_PROMOTE_WRITERS", "0", 0, 64)
     ack_value = flag_env("DSTATE_ACK_VALUE", "0")
     # Change-rate gate, its floor, time-based decay of the gate table, adaptation.
     min_change_pct = bounded_env("DSTATE_MIN_CHANGE_PCT", "0", 0, 100)
     min_changes = bounded_env("DSTATE_MIN_CHANGES", "2", 1, 1 << 20)
     writer_idle = bounded_env("DSTATE_WRITER_IDLE", "0", 0, 1 << 30)
-    adaptive_gate = flag_env("DSTATE_ADAPTIVE_GATE", "0")
+    gate_table = bounded_env("DSTATE_GATE_TABLE", "1024", 1, 1 << 16)
+    reject_as_getx = flag_env("DSTATE_REJECT_AS_GETX", "0")
+    promote_changes = bounded_env("DSTATE_PROMOTE_CHANGES", "0", 0, 1 << 20)
     for cpu in cpus:
         try:
             cpu.relaxedNoReturnAtomics = relaxed_amo
@@ -199,9 +203,6 @@ def create_system(
             send_evictions=send_evicts(options),
             d_state_enabled=enabled,
             d_state_delegate_from_s=delegate_from_s,
-            d_state_max_tenure=max_tenure,
-            d_state_tenure_idle=tenure_idle,
-            d_state_tenure_probe=tenure_probe,
             number_of_TBEs=num_tbes,
             transitions_per_cycle=options.ports,
             clk_domain=clk_domain,
@@ -287,14 +288,14 @@ def create_system(
             d_state_queue_stall=queue_stall,
             d_state_far_reads=far_reads,
             d_state_evict_for_delegate=evict_for_delegate,
-            d_state_min_writers=min_writers,
             d_state_writer_epoch=writer_epoch,
-            d_state_promote_writers=promote_writers,
             d_state_ack_value=ack_value,
             d_state_min_change_pct=min_change_pct,
             d_state_min_changes=min_changes,
             d_state_writer_idle=writer_idle,
-            d_state_adaptive_gate=adaptive_gate,
+            d_state_gate_table=gate_table,
+            d_state_reject_as_getx=reject_as_getx,
+            d_state_promote_changes=promote_changes,
             d_state_hit_latency=hit_latency,
             d_state_hotwords=hotwords,
             d_state_merge_limit=merge_limit,

@@ -131,13 +131,12 @@ ROI instrumentation and performance acceptance criteria.
 | `DSTATE_RANGE_LO_MB` / `_HI_MB` | 0 / 0 | When hi > lo, only adds to virtual addresses in [lo MB, hi MB) are delegated (static placement for oracle runs) |
 | `DSTATE_MAX_OUTSTANDING` | 16 | Per-core outstanding Ruby requests (gem5 default); applies to every mode |
 | `DSTATE_EVICT_FOR_DELEGATE` | 0 | 1: a delegated request to a line the home does not hold, in a full set, evicts a victim (as an L1 GETX does) instead of being rejected |
-| `DSTATE_MIN_WRITERS` / `DSTATE_WRITER_EPOCH` | 0 / 64 | Admission gate: accept a delegated update only once this many distinct cores have written the line in the current epoch of updates; otherwise reject it and the requester owns the line. 0 disables |
-| `DSTATE_PROMOTE_WRITERS` | 0 | Promote to D once this many distinct writers are seen in the epoch (0: the update-count rule) |
 | `DSTATE_ACK_VALUE` | 0 | 1: the terminal ACK carries the updated word (16 B response); a load of that word waiting behind the add completes from it |
-| `DSTATE_MIN_CHANGE_PCT` / `DSTATE_MIN_CHANGES` | 0 / 2 | Change-rate gate at the home: accept a delegated update only when the line's would-be ownership changes (a GETX from a non-owner when conventional, an update from a core other than the previous writer when delegated) are at least this percentage of its updates, and at least this many; counters halve every `DSTATE_WRITER_EPOCH` updates. 0 disables |
-| `DSTATE_WRITER_IDLE` | 0 | Time-based decay of the gate table: a line idle for this many cycles restarts as single-writer (0: the update-count epoch) |
-| `DSTATE_ADAPTIVE_GATE` | 0 | 1: per-bank adaptation of `DSTATE_MIN_CHANGE_PCT` in steps of 10 with an 8-window cooling-off period |
-| `DSTATE_MAX_TENURE` / `DSTATE_TENURE_IDLE` / `DSTATE_TENURE_PROBE` | 0 / 0 / 0 | Requester-side owner-tenure predictor (L1): delegate a line only if, the last time this L1 owned it, it performed at most this many adds before losing it; a record expires after the idle cycles; with probe=1 a line with no record is owned first so the tenure can be measured. 0 disables |
+| `DSTATE_MIN_CHANGE_PCT` / `DSTATE_MIN_CHANGES` | 0 / 2 | Change-rate gate at the home: accept a delegated update only when the line's would-be ownership changes (a GETX from a non-owner when conventional, an update from a core other than the previous writer when delegated) are at least this percentage of its updates, and at least this many; counters halve every `DSTATE_WRITER_EPOCH` updates (default 64). 0 disables |
+| `DSTATE_WRITER_IDLE` | 0 | Time-based decay of the gate table: a line idle for this many cycles starts over (0: never) |
+| `DSTATE_GATE_TABLE` | 1024 | Lines the gate table tracks per L2 bank (oldest dropped when full) |
+| `DSTATE_REJECT_AS_GETX` | 0 | 1: a delegated update the admission gate refuses is served as the requester's GETX (line arrives exclusive, the retained add is applied on arrival) instead of a NACK followed by the requester's own GETX; retained lines and structural refusals still NACK |
+| `DSTATE_PROMOTE_CHANGES` | 0 | Retain the line in D once the gate table shows this many would-be ownership changes for it (0: the update-count rule); replaces promotion on writers |
 | `DSTATE_TSO_SAMELINE` | 0 | 1 (O3 only): under TSO a younger no-return add to the same line may issue while older ones are in flight; the home applies the batch atomically, stores to other lines wait for all of them |
 
 Recommended set after the 2026-10 ablations: the `full` executor knobs (`DSTATE_QUEUE_DEPTH=16
@@ -145,12 +144,12 @@ DSTATE_INIT_INTERVAL=4 DSTATE_BUSY_STALL=1 DSTATE_QUEUE_STALL=1`), `DSTATE_REQ_C
 DSTATE_MERGE_LIMIT=64 DSTATE_HOTWORDS=32 DSTATE_HIT_LATENCY=4 DSTATE_FAR_READS=1
 DSTATE_READ_DOWNGRADE=64 DSTATE_EVICT_FOR_DELEGATE=1 DSTATE_DELTA_MIN_WORDS=2`, plus
 `DSTATE_TSO_SAMELINE=1` under TSO or `DSTATE_RELAXED_AMO=1` under relaxed ordering, and
-for admission `DSTATE_MIN_CHANGE_PCT=50 DSTATE_WRITER_IDLE=200000` (the change-rate gate
-with time decay: it cost no measured win at 4 or 16 cores and takes the Count-Min sketch
-at 4 cores from +24 % to +5 %). The distinct-writer gate (`DSTATE_MIN_WRITERS`) and the
-owner-tenure predictor (`DSTATE_MAX_TENURE=1 DSTATE_TENURE_PROBE=1`, which closes the
-sketch to a tie at 4 cores but loses the hot word and read-mixed wins at 16) remain
-available as knobs. The defaults stay at the conservative as-shipped values.
+for admission `DSTATE_MIN_CHANGE_PCT=90 DSTATE_WRITER_IDLE=200000 DSTATE_GATE_TABLE=256
+DSTATE_REJECT_AS_GETX=1 DSTATE_PROMOTE_CHANGES=2` (the change-rate gate with time decay, a
+256-entry table, cheap rejection and promotion on the gate's evidence; the round-8 section of the
+results page shows what each setting measured). The distinct-writer gate, promotion on writers, the adaptive
+threshold and the owner-tenure predictor of rounds 6–7 were measured and removed in round 8;
+their results stay on the results page. The defaults stay at the conservative as-shipped values.
 | `DSTATE_BUFFER_SIZE` | 32 | Entries per configured endpoint/trigger buffer |
 | `DSTATE_TBES` | 16 | L1/L2 controller TBE count |
 | `DSTATE_THRESHOLD` | 4 | Saturating accepted-update count needed for promotion |
