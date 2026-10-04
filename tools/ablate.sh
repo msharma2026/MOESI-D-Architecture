@@ -911,6 +911,84 @@ v9)
   all)
     for ph in latency final4 final8 final16 mesh; do echo "--- $ph $(date +%H:%M)"; bash "$0" v9 $ph; done ;;
   esac ;;
+v10)
+  # Round 10: (a) a remote-atomics baseline: the add executes at the home bank with the
+  # same executor, but nothing else of D-state (no retention, no far reads, no admission
+  # gate, no combining at either end) -- what a RAO-INT-style design would give; (b) the
+  # final configuration at 32 and 64 cores on the mesh. Phases: rao4|rao16|mesh32|mesh64
+  KN_EXEC="DSTATE_QUEUE_DEPTH=16 DSTATE_INIT_INTERVAL=4 DSTATE_BUSY_STALL=1 DSTATE_QUEUE_STALL=1"
+  FAR="DSTATE_FAR_READS=1 DSTATE_READ_DOWNGRADE=64 DSTATE_EVICT_FOR_DELEGATE=1"
+  ADM="DSTATE_MIN_CHANGE_PCT=90 DSTATE_MIN_CHANGES=2 DSTATE_WRITER_IDLE=200000 DSTATE_GATE_TABLE=256 DSTATE_REJECT_AS_GETX=1 DSTATE_PROMOTE_CHANGES=2"
+  FT="$KN_EXEC DSTATE_REQ_COMBINE=16 DSTATE_MERGE_LIMIT=64 DSTATE_EXEC_LATENCY=20 $FAR DSTATE_TSO_SAMELINE=1 DSTATE_DELTA_MIN_WORDS=2 DSTATE_ACK_VALUE=1 $ADM"
+  FTH="$KN_EXEC DSTATE_REQ_COMBINE=16 DSTATE_MERGE_LIMIT=64 DSTATE_HOTWORDS=32 DSTATE_HIT_LATENCY=4 $FAR DSTATE_TSO_SAMELINE=1 DSTATE_DELTA_MIN_WORDS=2 DSTATE_ACK_VALUE=1 $ADM"
+  FR="$KN_EXEC DSTATE_REQ_COMBINE=16 DSTATE_MERGE_LIMIT=64 DSTATE_HOTWORDS=32 DSTATE_HIT_LATENCY=4 $FAR DSTATE_RELAXED_AMO=1 DSTATE_DELTA_MIN_WORDS=2 $ADM"
+  # remote atomics: executor only; modes local,remote (remote = no retention)
+  RAO_T="$KN_EXEC DSTATE_EXEC_LATENCY=20 DSTATE_REQ_COMBINE=1 DSTATE_MERGE_LIMIT=0"
+  RAO_TH="$KN_EXEC DSTATE_HOTWORDS=32 DSTATE_HIT_LATENCY=4 DSTATE_REQ_COMBINE=1 DSTATE_MERGE_LIMIT=0"
+  RAO_TS="$RAO_T DSTATE_TSO_SAMELINE=1"
+  RAO_THS="$RAO_TH DSTATE_TSO_SAMELINE=1"
+  RAO_R="$RAO_TH DSTATE_RELAXED_AMO=1"
+  BUF16="DSTATE_BUFFER_SIZE=${BUF16:-256}"
+  PERF3="local,remote,persistent"
+  case ${2:-all} in
+  rao4)
+    MODES=local,remote matrix A0_multi512_4c_RAO_T     scatter_multi  "4 2000 512"     4 X86O3CPU $RAO_T &
+    MODES=local,remote matrix A1_multi512_4c_RAO_TS    scatter_multi  "4 2000 512"     4 X86O3CPU $RAO_TS &
+    MODES=local,remote matrix A2_multi512_4c_RAO_R     scatter_multi  "4 2000 512"     4 X86O3CPU $RAO_R &
+    wait
+    MODES=local,remote matrix A3_hotkey_4c_RAO_TH      scatter_dstate "4 200000 1"     4 X86O3CPU $RAO_TH &
+    MODES=local,remote matrix A4_hotkey_4c_RAO_THS     scatter_dstate "4 200000 1"     4 X86O3CPU $RAO_THS &
+    MODES=local,remote matrix A5_rw_4c_RAO_TS          scatter_rw     "4 200000 32 8"  4 X86O3CPU $RAO_TS &
+    wait
+    MODES=local,remote matrix A6_cms_4c_RAO_TS         cms_dstate     "4 20000"        4 X86O3CPU $RAO_TS &
+    MODES=local,remote matrix A7_phased_4c_RAO_R       scatter_phased "4 100 512 8"    4 X86O3CPU $RAO_R &
+    MODES=local,remote matrix A8_rw_4c_RAO_T           scatter_rw     "4 200000 32 8"  4 X86O3CPU $RAO_T &
+    wait ;;
+  rao16)
+    export TIMEOUT=7200
+    MODES=local,remote matrix A30_multi512_16c_RAO_R   scatter_multi  "16 500 512"     16 X86O3CPU $RAO_R $BUF16 &
+    MODES=local,remote matrix A31_hotkey_16c_RAO_THS   scatter_dstate "16 50000 1"     16 X86O3CPU $RAO_THS $BUF16 &
+    wait
+    MODES=local,remote matrix A32_rw_16c_RAO_TS        scatter_rw     "16 50000 32 8"  16 X86O3CPU $RAO_TS $BUF16 &
+    MODES=local,remote matrix A33_cms_16c_RAO_TS       cms_dstate     "16 5000"        16 X86O3CPU $RAO_TS $BUF16 &
+    wait
+    MODES=local,remote matrix A34_phased_16c_RAO_R     scatter_phased "16 25 512 8"    16 X86O3CPU $RAO_R $BUF16 &
+    MODES=local,remote matrix A35_multi512_16c_RAO_TS  scatter_multi  "16 500 512"     16 X86O3CPU $RAO_TS $BUF16 &
+    wait ;;
+  mesh32)
+    export TIMEOUT=14400
+    MODES=local,persistent BANKS=16 EXTRA="--num-dirs=16 --topology=Mesh_XY --mesh-rows=4" matrix M32_multi512_32c_FR_mesh scatter_multi "32 250 512" 32 X86O3CPU $FR DSTATE_BUFFER_SIZE=512 &
+    MODES=local,persistent BANKS=16 EXTRA="--num-dirs=16 --topology=Mesh_XY --mesh-rows=4" matrix M33_hotkey_32c_FTH_mesh scatter_dstate "32 25000 1" 32 X86O3CPU $FTH DSTATE_BUFFER_SIZE=512 &
+    wait
+    MODES=local,persistent BANKS=16 EXTRA="--num-dirs=16 --topology=Mesh_XY --mesh-rows=4" matrix M34_rw_32c_FT_mesh scatter_rw "32 25000 32 8" 32 X86O3CPU $FT DSTATE_BUFFER_SIZE=512 &
+    MODES=local,persistent BANKS=16 EXTRA="--num-dirs=16 --topology=Mesh_XY --mesh-rows=4" matrix M35_multi512_32c_FT_mesh scatter_multi "32 250 512" 32 X86O3CPU $FT DSTATE_BUFFER_SIZE=512 &
+    wait ;;
+  mesh64)
+    export TIMEOUT=28800
+    MODES=local,persistent BANKS=32 EXTRA="--num-dirs=32 --topology=Mesh_XY --mesh-rows=8" matrix M64_multi512_64c_FR_mesh scatter_multi "64 125 512" 64 X86O3CPU $FR DSTATE_BUFFER_SIZE=512 &
+    MODES=local,persistent BANKS=32 EXTRA="--num-dirs=32 --topology=Mesh_XY --mesh-rows=8" matrix M65_hotkey_64c_FTH_mesh scatter_dstate "64 12500 1" 64 X86O3CPU $FTH DSTATE_BUFFER_SIZE=512 &
+    wait
+    MODES=local,persistent BANKS=32 EXTRA="--num-dirs=32 --topology=Mesh_XY --mesh-rows=8" matrix M66_rw_64c_FT_mesh scatter_rw "64 12500 32 8" 64 X86O3CPU $FT DSTATE_BUFFER_SIZE=512 &
+    wait ;;
+  pr)
+    # PageRank push on a real graph (SNAP soc-Epinions1; set GRAPH to its path). The
+    # whole-program rows are dominated by loading the edge list; the *_roi rows need
+    # BENCH_DIR pointing at the libm5 build and time the two iterations only.
+    GRAPH=${GRAPH:-/home/ubuntu/soc-Epinions1.txt}
+    export TIMEOUT=14400
+    MODES=local,persistent matrix PR0_epinions_4c_FT   pagerank_push "4 $GRAPH 2"  4  X86O3CPU $FT &
+    MODES=local,persistent matrix PR1_epinions_16c_FT  pagerank_push "16 $GRAPH 2" 16 X86O3CPU $FT $BUF16 &
+    wait ;;
+  pr_roi)
+    GRAPH=${GRAPH:-/home/ubuntu/soc-Epinions1.txt}
+    export REQROI=1 TIMEOUT=14400
+    MODES=local,persistent matrix PR3_epinions_4c_FT_roi  pagerank_push "4 $GRAPH 2"  4  X86O3CPU $FT &
+    MODES=local,persistent matrix PR4_epinions_16c_FT_roi pagerank_push "16 $GRAPH 2" 16 X86O3CPU $FT $BUF16 &
+    MODES=local,persistent matrix PR5_epinions_16c_FR_roi pagerank_push "16 $GRAPH 2" 16 X86O3CPU $FR $BUF16 &
+    wait ;;
+  all)
+    for ph in rao4 rao16 mesh32 mesh64 pr; do echo "--- $ph $(date +%H:%M)"; bash "$0" v10 $ph; done ;;
+  esac ;;
 report)
   # One row per (run, mode). Update/response message counts come from the L1's terminal
   # ACK/NACK counters (Garnet emits no per-size-class msg_count); newBytes uses the derived

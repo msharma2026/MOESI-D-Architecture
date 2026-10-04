@@ -329,6 +329,34 @@ Not available: a ROI-instrumented Count-Min sketch (the libm5 build has only
 the four scatter benchmarks); its 4-core whole-program number is a tie, so the
 caveat does not change it.
 
+### Round 10 (2026-10-04): remote-atomics baseline, 32/64 cores, real graph, hardware cost
+
+No protocol changes; the gates of rounds 8–9 stand. What this round adds to the
+evidence, and how each item was checked:
+
+- **Remote-atomics baseline.** The same binary and executor (queue 16,
+  initiation 4, service 20, hot-word buffer where the MOESI-D row uses it) in
+  remote mode with far reads, the admission gate, home merging and requester
+  combining all off (`DSTATE_REQ_COMBINE=1 DSTATE_MERGE_LIMIT=0`, no `FAR_READS`,
+  no gate). Every run passes its oracle and coverage gate. The "+ batching" rows
+  add the CPU-side same-line batching the MOESI-D strict rows use, so the
+  difference between those rows and MOESI-D is the protocol alone.
+- **32 and 64 cores.** Mesh_XY 4×8 with 16 banks and 16 directories, and 8×8
+  with 32 and 32; 512-entry message buffers (the conventional baseline's
+  deadlock detector fires below that at these sizes). Local and retained modes
+  only, to bound simulation time.
+- **PageRank on soc-Epinions1.** The benchmark's oracle is a serial run of the
+  same CSR with the same fixed-point arithmetic, so a wrong result is a
+  protocol bug, not rounding; the native build (`-DDSTATE_NATIVE`) was checked
+  first. The graph is read by the simulated program through syscall emulation.
+  Two iterations keep the 16-core run within hours; the result is per-iteration
+  steady state after the first.
+- **CACTI.** Version 7 (HewlettPackard/cacti, master), 22 nm ITRS-HP, 350 K,
+  single port, no ECC, DETAILED output; configurations and raw output in
+  `results/cacti_22nm/`. Two structures (executor queue, hot-word buffer) are
+  below CACTI's smallest valid array and are modelled at 2–4× their size, so
+  their rows are upper bounds. The adder is not modelled.
+
 ### Measurement caveats that apply to every number
 
 - **Whole-program `simSeconds`, no ROI.** `libm5` was not built, so times include

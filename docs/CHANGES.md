@@ -6,6 +6,14 @@ by [`paper/MOESI-D Paper.pdf`](../paper/MOESI-D%20Paper.pdf). The PDF is kept
 unchanged because that DOI points to it. This page lists what in it no longer
 holds, what changed in the implementation, and where the current evidence is.
 
+## Round 10 (2026-10-04): remote-atomics baseline, 32/64 cores, a real graph, hardware cost
+
+No protocol changes. Added `bench/pagerank_push.c` (push PageRank on a SNAP
+edge list, fixed-point ranks, serial oracle), `tools/ablate.sh v10` (the
+remote-atomics baseline and the 32/64-core mesh phases), `tools/cacti_moesi_d.sh`
+with `results/cacti_22nm/`, and `docs/HARDWARE_COST.md`. The results page's
+round-10 section carries the numbers; README *Evidence status* summarizes them.
+
 ## Round 9 (2026-10-03): the recommended configuration, measured everywhere
 
 No code changes beyond the driver (`tools/ablate.sh v9`). The round-8

@@ -74,11 +74,25 @@ with D-state off; `results/ABLATION_2026-09-30.md` round 9 has every row):
 | Zipfian counters, strict | tie | — | tie |
 | graph push (memory-bound), strict | tie | — | tie |
 
+| PageRank push on soc-Epinions1 (real graph; two iterations, loop only), strict | 0.97× | — | 0.96× (relaxed 1.01×) |
+| 512 lines, relaxed, 32 / 64 cores (4×8 / 8×8 mesh) | 4.87× / 3.22× | | |
+| one hot word, strict, 32 / 64 cores (mesh) | 2.56× / 3.08× | | |
+| read every 8 adds, strict, 32 / 64 cores (mesh) | 2.33× / 2.32× | | |
+| remote atomics without the D state (same executor, no retention/far reads/gate/combining), 16 cores | hot word 0.56×, read-mixed 0.52×, 512 lines relaxed 0.86×, 512 lines strict 1.26× | | |
+
 "Strict" is x86 as deployed (TSO); "relaxed" needs relaxed no-return atomics in
-software or an ISA extension (RAO-INT). The 4-core read-mixed line is the one
+software or an ISA extension (RAO-INT). Round 10 adds a remote-atomics baseline
+(the same home-bank executor with none of the D-state machinery, i.e. what a
+RAO-INT-style design gives), 32- and 64-core mesh rows, PageRank on a real
+graph, and CACTI area/leakage estimates (`docs/HARDWARE_COST.md`: 0.039 mm² and
+~5 mW per L2 bank at 22 nm, 4.8 % / 7 % of the bank's data array). The 4-core read-mixed line is the one
 remaining loss; it is the load behind the add waiting for the home round trip
 (the executor's service time moves it by ±5 points over 10–30 cycles), and it
-becomes a win from 8 cores up.
+becomes a win from 8 cores up. PageRank on a real graph is a tie: its 2,372-line
+rank array does not fit in the L1s, so conventional adds are already L2 round
+trips and there is no migration to remove; delegation wins on contended lines
+that would otherwise ping-pong between L1s (counters, sketches, hub vertices),
+not on scatters over whole arrays.
 
 
 The [paper PDF](paper/MOESI-D%20Paper.pdf) and the

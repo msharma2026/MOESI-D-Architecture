@@ -15,7 +15,7 @@ LDLIBS ?=
 # LDLIBS=/path/to/gem5/util/m5/build/x86/out/libm5.a
 # ROI includes synchronization/final merge and excludes serial verification.
 
-DSTATE  := scatter_dstate scatter_nm scatter_multi scatter_rw scatter_phased scatter_mixed random_stress graph_push spmv_dstate
+DSTATE  := scatter_dstate scatter_nm scatter_multi scatter_rw scatter_phased scatter_mixed random_stress graph_push spmv_dstate pagerank_push
 BASE    := scatter_base scatter_base_nm scatter_multi_base scatter_rw_base spmv_base
 LITMUS  := litmus_dstate litmus_naive litmus_fc litmus_priv litmus_privstream
 CMS     := cms_dstate cms_naive cms_priv cms_privstream
