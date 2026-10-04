@@ -817,6 +817,100 @@ v8)
   all)
     for ph in gates prune table rejectx oracle promote rejectd oracle2 rejectg; do echo "--- $ph $(date +%H:%M)"; bash "$0" v8 $ph; done ;;
   esac ;;
+v9)
+  # Round 9: no new mechanisms. (a) latency sensitivity of the one open loss, (b) the
+  # recommended configuration on every workload at 4, 8 and 16 cores (the table the
+  # paper cites), (c) mesh and ROI-timed checks of it. Phases: latency|final4|final8|final16|mesh|roi|all
+  KN_V3="DSTATE_QUEUE_DEPTH=16 DSTATE_INIT_INTERVAL=4 DSTATE_BUSY_STALL=1 DSTATE_QUEUE_STALL=1 DSTATE_REQ_COMBINE=16 DSTATE_MERGE_LIMIT=64"
+  FAR="DSTATE_FAR_READS=1 DSTATE_READ_DOWNGRADE=64 DSTATE_EVICT_FOR_DELEGATE=1"
+  ADM="DSTATE_MIN_CHANGE_PCT=90 DSTATE_MIN_CHANGES=2 DSTATE_WRITER_IDLE=200000 DSTATE_GATE_TABLE=256 DSTATE_REJECT_AS_GETX=1 DSTATE_PROMOTE_CHANGES=2"
+  # final strict (TSO) set, with and without the hot-word buffer; final relaxed set
+  FT="$KN_V3 DSTATE_EXEC_LATENCY=20 $FAR DSTATE_TSO_SAMELINE=1 DSTATE_DELTA_MIN_WORDS=2 DSTATE_ACK_VALUE=1 $ADM"
+  FTH="$KN_V3 DSTATE_HOTWORDS=32 DSTATE_HIT_LATENCY=4 $FAR DSTATE_TSO_SAMELINE=1 DSTATE_DELTA_MIN_WORDS=2 DSTATE_ACK_VALUE=1 $ADM"
+  FR="$KN_V3 DSTATE_HOTWORDS=32 DSTATE_HIT_LATENCY=4 $FAR DSTATE_RELAXED_AMO=1 DSTATE_DELTA_MIN_WORDS=2 $ADM"
+  BUF16="DSTATE_BUFFER_SIZE=${BUF16:-256}"
+  PERF3="local,remote,persistent"
+  case ${2:-all} in
+  latency)
+    # the executor service time (20 cycles) and hot-word hit time (4) are assumptions:
+    # how much of the read-mixed loss is home latency, and what a faster home buys
+    MODES=$PERF3 matrix L10_rw800k_T4_final_exec10    scatter_rw     "4 200000 32 8"  4 X86O3CPU $FT DSTATE_EXEC_LATENCY=10 &
+    MODES=$PERF3 matrix L15_rw800k_T4_final_exec15    scatter_rw     "4 200000 32 8"  4 X86O3CPU $FT DSTATE_EXEC_LATENCY=15 &
+    MODES=$PERF3 matrix L30_rw800k_T4_final_exec30    scatter_rw     "4 200000 32 8"  4 X86O3CPU $FT DSTATE_EXEC_LATENCY=30 &
+    wait
+    MODES=$PERF3 matrix L2_rw800k_TH4_final_hit2      scatter_rw     "4 200000 32 8"  4 X86O3CPU $FTH DSTATE_HIT_LATENCY=2 &
+    MODES=$PERF3 matrix L4_rw800k_TH4_final_hit4      scatter_rw     "4 200000 32 8"  4 X86O3CPU $FTH &
+    MODES=$PERF3 matrix L8_rw800k_TH4_final_hit8      scatter_rw     "4 200000 32 8"  4 X86O3CPU $FTH DSTATE_HIT_LATENCY=8 &
+    wait
+    MODES=$PERF3 matrix L11_cms_T4_final_exec10       cms_dstate     "4 20000"        4 X86O3CPU $FT DSTATE_EXEC_LATENCY=10 &
+    MODES=$PERF3 matrix L12_hotkey800k_TH4_final_hit2 scatter_dstate "4 200000 1"     4 X86O3CPU $FTH DSTATE_HIT_LATENCY=2 &
+    MODES=$PERF3 matrix L13_multi512_T4_final_exec10  scatter_multi  "4 2000 512"     4 X86O3CPU $FT DSTATE_EXEC_LATENCY=10 &
+    wait
+    export TIMEOUT=7200
+    MODES=$PERF3 matrix L16_rw800k_16c_T4_final_exec10 scatter_rw    "16 50000 32 8"  16 X86O3CPU $FT DSTATE_EXEC_LATENCY=10 $BUF16 &
+    wait ;;
+  final4)
+    MODES=$PERF3 matrix N0_multi512_4c_FT      scatter_multi  "4 2000 512"      4 X86O3CPU $FT &
+    MODES=$PERF3 matrix N1_hotkey_4c_FTH       scatter_dstate "4 200000 1"      4 X86O3CPU $FTH &
+    MODES=$PERF3 matrix N2_scatter32_4c_FT     scatter_dstate "4 200000 32"     4 X86O3CPU $FT &
+    wait
+    MODES=$PERF3 matrix N3_rw_4c_FT            scatter_rw     "4 200000 32 8"   4 X86O3CPU $FT &
+    MODES=$PERF3 matrix N4_cms_4c_FT           cms_dstate     "4 20000"         4 X86O3CPU $FT &
+    MODES=$PERF3 matrix N5_phased_4c_FR        scatter_phased "4 100 512 8"     4 X86O3CPU $FR &
+    wait
+    MODES=$PERF3 matrix N6_multi512_4c_FR      scatter_multi  "4 2000 512"      4 X86O3CPU $FR &
+    MODES=$PERF3 matrix N7_zipf_4c_FT          litmus_dstate  "4 4000 2048"     4 X86O3CPU $FT &
+    MODES=$PERF3 matrix N8_zipf_4c_FR          litmus_dstate  "4 4000 2048"     4 X86O3CPU $FR &
+    wait
+    MODES=$PERF3 matrix N9_graph_4c_FT         graph_push     "4 1000000 65536 1" 4 X86O3CPU $FT &
+    MODES=$PERF3 matrix N10_graph_4c_FR        graph_push     "4 1000000 65536 1" 4 X86O3CPU $FR &
+    MODES=$PERF3 matrix N11_hotkey_4c_FR       scatter_dstate "4 200000 1"      4 X86O3CPU $FR &
+    wait
+    MODES=$PERF3 matrix N12_rw_4c_FR           scatter_rw     "4 200000 32 8"   4 X86O3CPU $FR &
+    MODES=$PERF3 matrix N13_cms_4c_FR          cms_dstate     "4 20000"         4 X86O3CPU $FR &
+    MODES=$PERF3 matrix N14_phased_4c_FT       scatter_phased "4 100 512 8"     4 X86O3CPU $FT &
+    wait ;;
+  final8)
+    export TIMEOUT=7200
+    MODES=$PERF3 matrix N20_multi512_8c_FT     scatter_multi  "8 1000 512"      8 X86O3CPU $FT $BUF16 &
+    MODES=$PERF3 matrix N21_hotkey_8c_FTH      scatter_dstate "8 100000 1"      8 X86O3CPU $FTH $BUF16 &
+    wait
+    MODES=$PERF3 matrix N22_rw_8c_FT           scatter_rw     "8 100000 32 8"   8 X86O3CPU $FT $BUF16 &
+    MODES=$PERF3 matrix N23_cms_8c_FT          cms_dstate     "8 10000"         8 X86O3CPU $FT $BUF16 &
+    wait
+    MODES=$PERF3 matrix N24_multi512_8c_FR     scatter_multi  "8 1000 512"      8 X86O3CPU $FR $BUF16 &
+    wait ;;
+  final16)
+    export TIMEOUT=7200
+    MODES=$PERF3 matrix N30_multi512_16c_FR    scatter_multi  "16 500 512"      16 X86O3CPU $FR $BUF16 &
+    MODES=$PERF3 matrix N31_hotkey_16c_FTH     scatter_dstate "16 50000 1"      16 X86O3CPU $FTH $BUF16 &
+    wait
+    MODES=$PERF3 matrix N32_rw_16c_FT          scatter_rw     "16 50000 32 8"   16 X86O3CPU $FT $BUF16 &
+    MODES=$PERF3 matrix N33_cms_16c_FT         cms_dstate     "16 5000"         16 X86O3CPU $FT $BUF16 &
+    wait
+    MODES=$PERF3 matrix N34_phased_16c_FR      scatter_phased "16 25 512 8"     16 X86O3CPU $FR $BUF16 &
+    MODES=$PERF3 matrix N35_multi512_16c_FT    scatter_multi  "16 500 512"      16 X86O3CPU $FT $BUF16 &
+    wait
+    MODES=$PERF3 matrix N36_graph_16c_FT       graph_push     "16 2000000 65536 1" 16 X86O3CPU $FT $BUF16 &
+    MODES=$PERF3 matrix N37_zipf_16c_FT        litmus_dstate  "16 1000 2048"    16 X86O3CPU $FT $BUF16 &
+    wait ;;
+  mesh)
+    export TIMEOUT=7200
+    MODES=$PERF3 BANKS=8 EXTRA="--num-dirs=8 --topology=Mesh_XY --mesh-rows=4" matrix N40_multi512_16c_FR_mesh scatter_multi "16 500 512" 16 X86O3CPU $FR $BUF16 &
+    MODES=$PERF3 BANKS=8 EXTRA="--num-dirs=8 --topology=Mesh_XY --mesh-rows=4" matrix N41_hotkey_16c_FTH_mesh  scatter_dstate "16 50000 1" 16 X86O3CPU $FTH $BUF16 &
+    wait ;;
+  roi)
+    # ROI-instrumented guests: BENCH_DIR must point at the libm5 build (see round 5)
+    export REQROI=1 TIMEOUT=7200
+    MODES=$PERF3 matrix N50_hotkey_16c_FTH_roi  scatter_dstate "16 50000 1"     16 X86O3CPU $FTH $BUF16 &
+    MODES=$PERF3 matrix N51_multi512_16c_FR_roi scatter_multi  "16 500 512"     16 X86O3CPU $FR $BUF16 &
+    wait
+    MODES=$PERF3 matrix N52_rw_16c_FT_roi       scatter_rw     "16 50000 32 8"  16 X86O3CPU $FT $BUF16 &
+    MODES=$PERF3 matrix N53_cms_4c_FT_roi       cms_dstate     "4 20000"        4 X86O3CPU $FT &
+    wait ;;
+  all)
+    for ph in latency final4 final8 final16 mesh; do echo "--- $ph $(date +%H:%M)"; bash "$0" v9 $ph; done ;;
+  esac ;;
 report)
   # One row per (run, mode). Update/response message counts come from the L1's terminal
   # ACK/NACK counters (Garnet emits no per-size-class msg_count); newBytes uses the derived

@@ -6,6 +6,15 @@ by [`paper/MOESI-D Paper.pdf`](../paper/MOESI-D%20Paper.pdf). The PDF is kept
 unchanged because that DOI points to it. This page lists what in it no longer
 holds, what changed in the implementation, and where the current evidence is.
 
+## Round 9 (2026-10-03): the recommended configuration, measured everywhere
+
+No code changes beyond the driver (`tools/ablate.sh v9`). The round-8
+recommended knob set was run on every workload at 4, 8 and 16 cores, on the
+4×4 mesh and with ROI-only timing, and the executor and hot-word latencies were
+varied; README *Evidence status* carries the resulting table. The read-mixed
+loss at 4 cores is bounded as a network-round-trip effect (±5 points over
+executor latencies 10–30) and becomes a win from 8 cores.
+
 ## Round 8 (2026-10-03): pruning, cheap rejection, speculation oracle
 
 Removed, with their results kept on the results page: the distinct-writer gate

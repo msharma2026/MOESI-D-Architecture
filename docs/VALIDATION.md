@@ -304,6 +304,31 @@ the single-request paths inside the combining logic (a first version missed
 those and over-counted "no local copy"; corrected and rerun before the numbers
 were taken).
 
+### Round 9 (2026-10-03): the recommended configuration on every workload
+
+No new mechanisms. Every workload at 4, 8 and 16 cores, the 4×4 mesh and
+ROI-only timing were run with one knob set (README, *Configuration*), so that
+one table carries the current numbers and no row in it depends on a knob
+chosen for that row. Every run CORRECT and through the coverage gate. Three
+things this round checked that earlier rounds could not:
+
+- **Latency assumptions.** The executor service time (20 cycles) and hot-word
+  hit time (4) were varied. The read-mixed loss at 4 cores moves from +30 % to
+  +40 % over 10–30 cycles: it is the round trip under TSO, not the executor.
+  The many-line win is executor-bound: 512 lines at 4 cores goes from −21 % to
+  −39 % at 10 cycles, read-mixed at 16 cores from 1.72× to 2.03×. The hot-word
+  buffer (hit 2/4/8) does not help read-mixed and slightly hurts it (+46–49 %
+  with the buffer vs +35 % without), so the recommended strict set uses it only
+  for single-word workloads.
+- **8 cores.** Read-mixed crosses from a 35 % loss at 4 cores to a 1.11× win at
+  8; everything else at 8 matches its 4- and 16-core neighbours.
+- **ROI-only timing** on the 16-core rows (round-9 section), to bound the
+  thread start/exit share of the whole-program numbers quoted elsewhere.
+
+Not available: a ROI-instrumented Count-Min sketch (the libm5 build has only
+the four scatter benchmarks); its 4-core whole-program number is a tie, so the
+caveat does not change it.
+
 ### Measurement caveats that apply to every number
 
 - **Whole-program `simSeconds`, no ROI.** `libm5` was not built, so times include

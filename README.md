@@ -59,6 +59,28 @@ to the v1.0.0 paper.
 
 ## Evidence status
 
+Current numbers (round 9, recommended configuration, D-state vs the same binary
+with D-state off; `results/ABLATION_2026-09-30.md` round 9 has every row):
+
+| workload | 4 cores | 8 cores | 16 cores |
+|---|---:|---:|---:|
+| 512 scattered lines, strict (TSO) | −21 % | −21 % | 1.26× |
+| 512 scattered lines, relaxed | 3.35× | 3.26× | 2.26× (crossbar), 4.95× (4×4 mesh) |
+| one hot word, strict | tie | −1 % | 1.62× (1.69× mesh) |
+| 32 counters on one line, strict | tie | — | — |
+| read every 8 adds, strict | +35 % | 1.11× | 1.72× |
+| Count-Min sketch, strict | +0.9 % | +1.5 % | +0.5 % |
+| phased update/read, relaxed | 3.01× | — | 2.29× |
+| Zipfian counters, strict | tie | — | tie |
+| graph push (memory-bound), strict | tie | — | tie |
+
+"Strict" is x86 as deployed (TSO); "relaxed" needs relaxed no-return atomics in
+software or an ISA extension (RAO-INT). The 4-core read-mixed line is the one
+remaining loss; it is the load behind the add waiting for the home round trip
+(the executor's service time moves it by ±5 points over 10–30 cycles), and it
+becomes a win from 8 cores up.
+
+
 The [paper PDF](paper/MOESI-D%20Paper.pdf) and the
 [v1.0.0 DOI](https://doi.org/10.5281/zenodo.22889936) describe the earlier
 artifact. Their performance and correctness claims are **not evidence for this
